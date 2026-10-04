@@ -475,6 +475,7 @@ pub enum EngineMethod {
     engine_getPayloadV4,
     // osaka
     engine_getBlobsV2,
+    engine_getBlobsV3,
     engine_getPayloadV5,
 }
 

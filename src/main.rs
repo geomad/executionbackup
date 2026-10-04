@@ -1135,7 +1135,8 @@ impl NodeRouter {
             | EngineMethod::engine_getPayloadBodiesByHashV1
             | EngineMethod::engine_getPayloadBodiesByRangeV1
             | EngineMethod::engine_getBlobsV1
-            | EngineMethod::engine_getBlobsV2 => {
+            | EngineMethod::engine_getBlobsV2
+            | EngineMethod::engine_getBlobsV3 => {
                 // Send to primary node
                 let primary_node = match self.get_execution_node().await {
                     Some(primary_node) => primary_node,
