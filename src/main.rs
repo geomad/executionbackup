@@ -212,16 +212,24 @@ impl NodeRouter {
     where
         T: serde::de::DeserializeOwned,
     {
-        let mut syncing_size: usize = 0;
         let mut nodes = self.alive_nodes.read().await.clone();
 
         if use_syncing_nodes {
             let mut syncing_nodes = self.alive_but_syncing_nodes.read().await.clone();
-            syncing_size += syncing_nodes.len();
             nodes.append(&mut syncing_nodes);
         }
 
-        let mut futs = Vec::with_capacity(nodes.len() + syncing_size);
+        Self::requests_to_nodes(request, nodes).await
+    }
+
+    async fn requests_to_nodes<T>(
+        request: &RpcRequest,
+        nodes: Vec<Arc<Node>>,
+    ) -> (Vec<(Arc<Node>, T)>, Option<serde_json::Value>)
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let mut futs = Vec::with_capacity(nodes.len());
 
         nodes.iter().for_each(|node| {
             futs.push(async {
@@ -524,33 +532,48 @@ impl NodeRouter {
         }
     }
 
-    async fn fcu_logic(
+    async fn engine_requests<T>(
         &self,
-        resps: &mut Vec<PayloadStatusV1>,
-        req: &RpcRequest,
-    ) -> Result<PayloadStatusV1, FcuLogicError> {
-        // send to the syncing nodes to help them catch up with tokio::spawn so we don't have to wait for them
-        let syncing_nodes = self.alive_but_syncing_nodes.clone();
-        let req_clone = req.clone();
-        tokio::spawn(async move {
-            let syncing_nodes = syncing_nodes.read().await.clone();
-            if syncing_nodes.is_empty() {
-                return;
+        request: &RpcRequest,
+    ) -> (Vec<(Arc<Node>, T)>, Option<serde_json::Value>)
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        // Snapshot both lists in recheck's lock order, then release the guards
+        // before dispatch. A node must receive this request exactly once.
+        let (mut foreground, syncing) = {
+            let syncing = self.alive_but_syncing_nodes.read().await;
+            let alive = self.alive_nodes.read().await;
+            (alive.clone(), syncing.clone())
+        };
+        let mut background = Vec::new();
+        if foreground.is_empty() {
+            for node in syncing {
+                if node.do_not_use {
+                    background.push(node);
+                } else {
+                    foreground.push(node);
+                }
             }
-
-            tracing::debug!(
-                "Sending fcU or newPayload to {} syncing nodes",
-                syncing_nodes.len()
-            );
-
-            join_all(
-                syncing_nodes
-                    .iter()
-                    .map(|node| node.do_request_no_timeout(&req_clone)),
-            )
-            .await;
+        } else {
+            background = syncing;
+        }
+        let req = request.clone();
+        tokio::spawn(async move {
+            if !background.is_empty() {
+                tracing::debug!(
+                    "Sending fcU or newPayload to {} syncing nodes in background",
+                    background.len()
+                );
+                // Apply the same bounded timeout as foreground requests. A
+                // stalled EL must not leave an unbounded backlog of tasks.
+                join_all(background.iter().map(|node| node.do_request(&req))).await;
+            }
         });
+        Self::requests_to_nodes(request, foreground).await
+    }
 
+    fn fcu_logic(&self, resps: &mut [PayloadStatusV1]) -> Result<PayloadStatusV1, FcuLogicError> {
         if resps.is_empty() {
             // no responses, so return SYNCING
             tracing::error!("No responses, returning SYNCING.");
@@ -683,11 +706,10 @@ impl NodeRouter {
                     Ok(payload) => payload,
                     Err(error) => return (rpc_error(&request.id, -32602, &error), 200),
                 };
-                let (responses, error) = self
-                    .concurrent_requests::<PayloadStatusV1>(request, false)
-                    .await;
-                let mut statuses = responses.into_iter().map(|(_, status)| status).collect();
-                match self.fcu_logic(&mut statuses, request).await {
+                let (responses, error) = self.engine_requests::<PayloadStatusV1>(request).await;
+                let mut statuses: Vec<_> =
+                    responses.into_iter().map(|(_, status)| status).collect();
+                match self.fcu_logic(&mut statuses) {
                     Ok(status) => (make_response(&request.id, json!(status)), 200),
                     Err(FcuLogicError::NoResponses) if error.is_some() => (
                         json!({"jsonrpc":"2.0", "id":request.id, "error":error}).to_string(),
@@ -730,13 +752,13 @@ impl NodeRouter {
                 }
                 // Forward all params intact, including custodyColumns even with null attributes.
                 let (responses, error) = self
-                    .concurrent_requests::<forkchoiceUpdatedResponse>(request, false)
+                    .engine_requests::<forkchoiceUpdatedResponse>(request)
                     .await;
-                let mut statuses = responses
+                let mut statuses: Vec<_> = responses
                     .iter()
                     .map(|(_, response)| response.payloadStatus.clone())
                     .collect();
-                let status = match self.fcu_logic(&mut statuses, request).await {
+                let status = match self.fcu_logic(&mut statuses) {
                     Ok(status) => status,
                     Err(FcuLogicError::NoResponses) if error.is_some() => {
                         return (
@@ -1717,6 +1739,98 @@ mod glamsterdam_tests {
         drop(alive_guard);
         drop(syncing_guard);
         assert_eq!(selection.await.unwrap().url, node.url);
+    }
+
+    #[tokio::test]
+    async fn only_syncing_backend_returns_real_status_errors_and_build_ids() {
+        let el = MockEl::new().await;
+        let router = router(&[&el]).await;
+        router.alive_nodes.write().await.clear();
+        router
+            .alive_but_syncing_nodes
+            .write()
+            .await
+            .push(el.node.clone());
+        el.node.set_online_and_syncing().await;
+        for version in 1..=4 {
+            let method = format!("engine_forkchoiceUpdatedV{}", version);
+            for state in ["VALID", "INVALID", "SYNCING"] {
+                el.result(&method, fcu_result(state, Value::Null)).await;
+                assert_eq!(
+                    call(&router, &fcu(version, false)).await["result"]["payloadStatus"]["status"],
+                    state
+                );
+            }
+            el.error(&method, -38002).await;
+            assert_eq!(
+                call(&router, &fcu(version, false)).await["error"]["code"],
+                -38002
+            );
+        }
+        for state in ["VALID", "INVALID", "SYNCING", "ACCEPTED"] {
+            el.result("engine_newPayloadV5", status(state)).await;
+            assert_eq!(
+                call(&router, &new_payload(true)).await["result"]["status"],
+                state
+            );
+        }
+        el.result(
+            "engine_forkchoiceUpdatedV4",
+            fcu_result("VALID", json!("0x1111111111111111")),
+        )
+        .await;
+        el.result("engine_getPayloadV6", envelope(true, "0x1"))
+            .await;
+        let build = call(&router, &fcu(4, true)).await;
+        let get = request("engine_getPayloadV6", json!([build["result"]["payloadId"]]));
+        assert_eq!(call(&router, &get).await["result"], envelope(true, "0x1"));
+    }
+
+    #[tokio::test]
+    async fn syncing_fallback_preserves_votes_and_excludes_do_not_use() {
+        let a = MockEl::new().await;
+        let b = MockEl::new().await;
+        let mut excluded = MockEl::new().await;
+        Arc::make_mut(&mut excluded.node).do_not_use = true;
+        let router = router(&[&a, &b, &excluded]).await;
+        router.alive_nodes.write().await.clear();
+        *router.alive_but_syncing_nodes.write().await =
+            vec![a.node.clone(), b.node.clone(), excluded.node.clone()];
+        for el in [&a, &b, &excluded] {
+            el.node.set_online_and_syncing().await;
+            el.result("engine_newPayloadV5", status("VALID")).await;
+        }
+        excluded
+            .result("engine_newPayloadV5", status("INVALID"))
+            .await;
+        assert_eq!(
+            call(&router, &new_payload(true)).await["result"]["status"],
+            "VALID"
+        );
+        b.result("engine_newPayloadV5", status("INVALID")).await;
+        assert_eq!(
+            call(&router, &new_payload(true)).await["result"]["status"],
+            "SYNCING"
+        );
+        a.result("engine_newPayloadV5", status("INVALID")).await;
+        assert_eq!(
+            call(&router, &new_payload(true)).await["result"]["status"],
+            "INVALID"
+        );
+        *router.alive_but_syncing_nodes.write().await = vec![excluded.node.clone()];
+        assert_eq!(
+            call(&router, &new_payload(true)).await["result"]["status"],
+            "SYNCING"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while excluded.seen.lock().await.len() < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(a.seen.lock().await.len(), 3);
+        assert_eq!(b.seen.lock().await.len(), 3);
     }
 
     #[test]
