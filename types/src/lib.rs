@@ -428,7 +428,7 @@ pub struct Claims {
     pub iat: i64,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum SyncingStatus {
     Synced,
     Offline,
