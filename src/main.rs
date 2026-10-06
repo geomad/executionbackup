@@ -415,7 +415,7 @@ impl NodeRouter {
     // if there are no online nodes, try to use a syncing node
     // if there are no syncing nodes, return None
     async fn get_execution_node(&self) -> Option<Arc<Node>> {
-        let primary_node = self.primary_node.read().await;
+        let primary_node = self.primary_node.read().await.clone();
 
         if primary_node.status.read().await.status == SyncingStatus::Synced {
             return Some(primary_node.clone());
@@ -424,10 +424,10 @@ impl NodeRouter {
         let old_primary_node_url = primary_node.url.clone(); // we're going to change it
         drop(primary_node);
 
-        let alive_nodes = self.alive_nodes.read().await;
+        let alive_nodes = self.alive_nodes.read().await.clone();
 
         if alive_nodes.is_empty() {
-            let alive_but_syncing_nodes = self.alive_but_syncing_nodes.read().await;
+            let alive_but_syncing_nodes = self.alive_but_syncing_nodes.read().await.clone();
             if alive_but_syncing_nodes.is_empty() {
                 None
             } else {
@@ -449,7 +449,7 @@ impl NodeRouter {
                 }
             }
             // no synced nodes that are not the primary node, so return a syncing node
-            let alive_but_syncing_nodes = self.alive_but_syncing_nodes.read().await;
+            let alive_but_syncing_nodes = self.alive_but_syncing_nodes.read().await.clone();
             if alive_but_syncing_nodes.is_empty() {
                 // no synced or syncing nodes, so return None
                 None
@@ -1062,44 +1062,28 @@ async fn route_all(
 async fn make_metrics_report(
     router: Arc<NodeRouter>,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    let syncing_nodes = router.alive_but_syncing_nodes.read().await;
-    let alive_nodes = router.alive_nodes.read().await;
-    let mut both = syncing_nodes.clone();
-    both.append(&mut alive_nodes.clone());
-    drop(alive_nodes);
-    drop(syncing_nodes);
-
-    let mut futs = Vec::new();
-    both.iter().for_each(|node| {
-        futs.push(async move { (node.url.clone(), node.status.read().await.resp_time) })
-    });
-
-    let resp_times: HashMap<String, u128> = join_all(futs).await.into_iter().collect();
+    // Release each list guard before acquiring another. Recheck writes these
+    // lists together; retaining a read guard here can invert its lock order.
+    let syncing_nodes = router.alive_but_syncing_nodes.read().await.clone();
+    let alive_nodes = router.alive_nodes.read().await.clone();
+    let dead_nodes = router.dead_nodes.read().await.clone();
+    let primary_node = router.primary_node.read().await.url.clone();
+    let resp_times: HashMap<String, u128> = join_all(
+        syncing_nodes
+            .iter()
+            .chain(&alive_nodes)
+            .map(|node| async move { (node.url.clone(), node.status.read().await.resp_time) }),
+    )
+    .await
+    .into_iter()
+    .collect();
 
     let metrics_report = MetricsReport {
         response_times: resp_times,
-        alive_nodes: router
-            .alive_nodes
-            .read()
-            .await
-            .iter()
-            .map(|node| node.url.clone())
-            .collect(),
-        syncing_nodes: router
-            .alive_but_syncing_nodes
-            .read()
-            .await
-            .iter()
-            .map(|node| node.url.clone())
-            .collect(),
-        dead_nodes: router
-            .dead_nodes
-            .read()
-            .await
-            .iter()
-            .map(|node| node.url.clone())
-            .collect(),
-        primary_node: router.primary_node.read().await.url.clone(),
+        alive_nodes: alive_nodes.iter().map(|node| node.url.clone()).collect(),
+        syncing_nodes: syncing_nodes.iter().map(|node| node.url.clone()).collect(),
+        dead_nodes: dead_nodes.iter().map(|node| node.url.clone()).collect(),
+        primary_node,
     };
 
     serde_json::to_value(metrics_report)
@@ -1703,6 +1687,36 @@ mod glamsterdam_tests {
         assert_eq!(response["id"], request.id);
         assert_eq!(response["jsonrpc"], "2.0");
         response
+    }
+
+    #[tokio::test]
+    async fn syncing_selection_does_not_hold_alive_lock_while_waiting() {
+        let node = Arc::new(Node::new(
+            "http://127.0.0.1".into(),
+            JwtKey::from_secret(&[1; 32]),
+            Duration::from_secs(1),
+            false,
+        ));
+        node.set_online_and_syncing().await;
+        let router = NodeRouter::new(0.6, vec![node.clone()], node.clone(), false, None, None);
+        router
+            .alive_but_syncing_nodes
+            .write()
+            .await
+            .push(node.clone());
+
+        // Reproduce recheck holding the syncing lock while it needs alive_nodes.
+        let syncing_guard = router.alive_but_syncing_nodes.write().await;
+        let selection = router.get_execution_node();
+        tokio::pin!(selection);
+        assert!(futures::poll!(&mut selection).is_pending());
+        let alive_guard =
+            tokio::time::timeout(Duration::from_millis(100), router.alive_nodes.write())
+                .await
+                .expect("routing retained alive_nodes while waiting for syncing_nodes");
+        drop(alive_guard);
+        drop(syncing_guard);
+        assert_eq!(selection.await.unwrap().url, node.url);
     }
 
     #[test]
