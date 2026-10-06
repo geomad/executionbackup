@@ -1,12 +1,12 @@
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
 use ethereum_types::{Address, Signature, H256, H64, U256};
-use jsonwebtoken::EncodingKey;
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use metastruct::metastruct;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use ssz_types::{
-    typenum::{U1, U1048576, U1073741824, U16, U8192},
+    typenum::{U1048576, U1073741824},
     VariableList,
 };
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
@@ -55,87 +55,118 @@ pub struct PayloadIdNode {
     pub payload_id: String,
 }
 
+pub struct PayloadCandidate {
+    pub result: serde_json::Value,
+    pub block_value: U256,
+    pub block_number: u64,
+}
+
 impl PayloadIdNode {
-    // We're going to use Option instead of result because we end up discarding this result if it's None, and the node requestor function will display the error already.
     pub async fn get_payload(
         self,
         mut request: RpcRequest,
-        jwt_token: String,
         fork: &ForkName,
-    ) -> Option<getPayloadResponse> {
-        request.params = json!(vec![self.payload_id]);
-
-        tracing::debug!("Sending getPayload request to node {}", self.node.url);
-        let res = parse_result(
-            &self
-                .node
-                .do_request_timeout(&request, jwt_token, Duration::from_millis(800))
-                .await
-                .ok()?,
-        )
-        .ok()?;
-
-        match fork {
-            ForkName::Merge => {
-                unimplemented!(
-                    "getPayloadV1 shouldn't use this function since there's no benefit to it."
-                ) // Just pass the payloadId from CL directly to primary EL
-            }
-            ForkName::Shanghai => {
-                // V1 OR V2
-                match serde_json::from_value::<getPayloadResponseV2>(res.clone()) {
-                    Ok(val) => Some(getPayloadResponse::V2(val)),
-                    Err(_) => {
-                        tracing::debug!("{}: getPayloadV2 request but did not match on getPayloadResponseV2, trying V1", self.node.url);
-
-                        match serde_json::from_value::<getPayloadResponseV1>(res.clone()) {
-                            Ok(val) => Some(getPayloadResponse::V1(val)),
-                            Err(e) => {
-                                tracing::error!("{}: Couldn't derive getPayloadResponseV1 for getPayloadV2: {}. Payload body: {:?}", self.node.url, e, res);
-                                None
-                            }
-                        }
-                    }
-                }
-            }
-            ForkName::Cancun => {
-                // V3
-                match serde_json::from_value::<getPayloadResponseV3>(res.clone()) {
-                    Ok(val) => Some(getPayloadResponse::V3(val)),
-                    Err(e) => {
-                        tracing::error!("{}: Couldn't derive getPayloadResponseV3 for getPayloadV3: {}. Payload body: {:?}", self.node.url, e, res);
-                        None
-                    }
-                }
-            }
-            ForkName::Prague => match serde_json::from_value::<getPayloadResponseV4>(res.clone()) {
-                Ok(val) => Some(getPayloadResponse::V4(val)),
-                Err(e) => {
-                    tracing::error!("{}: Couldn't derive getPayloadResponseV4 for getPayloadV4: {}. Payload body: {:?}", self.node.url, e, res);
-                    None
-                }
-            },
-            ForkName::Osaka => match serde_json::from_value::<getPayloadResponseV5>(res.clone()) {
-                Ok(val) => Some(getPayloadResponse::V5(val)),
-                Err(e) => {
-                    tracing::error!("{}: Couldn't derive getPayloadResponseV5 for getPayloadV4: {}. Payload body: {:?}", self.node.url, e, res);
-                    None
-                }
-            },
+    ) -> Result<PayloadCandidate, serde_json::Value> {
+        request.params = json!([self.payload_id]);
+        let invalid = |message: String| json!({"code": -32603, "message": message});
+        let body = self
+            .node
+            .do_request_timeout(&request, Duration::from_millis(800))
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        let response: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| invalid(e.to_string()))?;
+        if let Some(error) = response.get("error") {
+            return Err(error.clone());
         }
+        let result = response
+            .get("result")
+            .ok_or_else(|| invalid("Missing result".into()))?;
+        // Validate the versioned envelope, but return the original JSON intact. This
+        // keeps bundles, execution requests and client extensions with their payload.
+        let parsed = match fork {
+            ForkName::Merge => {
+                serde_json::from_value::<ExecutionPayloadV1>(result.clone()).map(|_| ())
+            }
+            ForkName::Shanghai => serde_json::from_value::<getPayloadResponseV2>(result.clone())
+                .map(|_| ())
+                .or_else(|_| {
+                    serde_json::from_value::<getPayloadResponseV1>(result.clone()).map(|_| ())
+                }),
+            ForkName::Cancun => {
+                serde_json::from_value::<getPayloadResponseV3>(result.clone()).map(|_| ())
+            }
+            ForkName::Prague => {
+                serde_json::from_value::<getPayloadResponseV4>(result.clone()).map(|_| ())
+            }
+            ForkName::Osaka => {
+                serde_json::from_value::<getPayloadResponseV5>(result.clone()).map(|_| ())
+            }
+            ForkName::Amsterdam => {
+                serde_json::from_value::<getPayloadResponseV6>(result.clone()).map(|_| ())
+            }
+        };
+        parsed.map_err(|e| {
+            invalid(format!(
+                "Invalid getPayload response from {}: {}",
+                self.node.url, e
+            ))
+        })?;
+        let (block_value, number) = if matches!(fork, ForkName::Merge) {
+            (U256::zero(), &result["blockNumber"])
+        } else {
+            (
+                serde_json::from_value::<U256>(result["blockValue"].clone())
+                    .map_err(|e| invalid(e.to_string()))?,
+                &result["executionPayload"]["blockNumber"],
+            )
+        };
+        let number: QuantityU64 =
+            serde_json::from_value(number.clone()).map_err(|e| invalid(e.to_string()))?;
+        Ok(PayloadCandidate {
+            result: result.clone(),
+            block_value,
+            block_number: number.value,
+        })
     }
 }
 
-pub fn make_jwt(
-    jwt_key: &jsonwebtoken::EncodingKey,
-) -> Result<String, jsonwebtoken::errors::Error> {
+pub fn make_jwt(jwt_key: &JwtKey) -> Result<String, jsonwebtoken::errors::Error> {
     let claim_inst = Claims {
         iat: chrono::Utc::now().timestamp(),
     };
-    jsonwebtoken::encode(&JWT_HEADER, &claim_inst, jwt_key)
+    jsonwebtoken::encode(&JWT_HEADER, &claim_inst, &jwt_key.encoding)
 }
 
-pub fn read_jwt(path: &str) -> Result<jsonwebtoken::EncodingKey, String> {
+#[derive(Clone)]
+pub struct JwtKey {
+    encoding: EncodingKey,
+    decoding: DecodingKey,
+}
+
+impl JwtKey {
+    pub fn from_secret(secret: &[u8]) -> Self {
+        Self {
+            encoding: EncodingKey::from_secret(secret),
+            decoding: DecodingKey::from_secret(secret),
+        }
+    }
+
+    pub fn verifies(&self, authorization: &str) -> bool {
+        let Some(token) = authorization.strip_prefix("Bearer ") else {
+            return false;
+        };
+        let mut validation = jsonwebtoken::Validation::new(DEFAULT_ALGORITHM);
+        validation.required_spec_claims.clear();
+        validation.required_spec_claims.insert("iat".into());
+        validation.validate_exp = false;
+        validation.validate_aud = false;
+        jsonwebtoken::decode::<Claims>(token, &self.decoding, &validation)
+            .is_ok_and(|token| token.claims.iat.abs_diff(chrono::Utc::now().timestamp()) <= 60)
+    }
+}
+
+pub fn read_jwt(path: &str) -> Result<JwtKey, String> {
     let jwt_secret =
         std::fs::read_to_string(path).map_err(|e| format!("Error reading jwt file: {}", e))?;
     let jwt_secret = jwt_secret.trim().to_string();
@@ -146,7 +177,7 @@ pub fn read_jwt(path: &str) -> Result<jsonwebtoken::EncodingKey, String> {
         .unwrap_or(&jwt_secret)
         .to_string();
 
-    Ok(EncodingKey::from_secret(
+    Ok(JwtKey::from_secret(
         &hex::decode(jwt_secret).map_err(|e| format!("Could not decode JWT: {}", e))?,
     ))
 }
@@ -206,43 +237,7 @@ pub enum ForkName {
     Cancun,
     Prague,
     Osaka,
-}
-
-pub struct ForkConfig {
-    //  pub MERGE_FORK_EPOCH: Option<u64> = Some(144896);
-    pub shanghai_fork_epoch: u64,
-    pub cancun_fork_epoch: u64,
-    pub prague_fork_epoch: u64,
-    pub osaka_fork_epoch: u64,
-}
-
-impl ForkConfig {
-    pub fn mainnet() -> Self {
-        ForkConfig {
-            shanghai_fork_epoch: 194048,
-            cancun_fork_epoch: 269568,
-            prague_fork_epoch: 364032,
-            osaka_fork_epoch: 411392,
-        }
-    }
-
-    pub fn holesky() -> Self {
-        ForkConfig {
-            shanghai_fork_epoch: 256,
-            cancun_fork_epoch: 29696,
-            prague_fork_epoch: 115968,
-            osaka_fork_epoch: 165120,
-        }
-    }
-
-    pub fn sepolia() -> Self {
-        ForkConfig {
-            shanghai_fork_epoch: 56832,
-            cancun_fork_epoch: 132608,
-            prague_fork_epoch: 222464,
-            osaka_fork_epoch: 272640,
-        }
-    }
+    Amsterdam,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -293,7 +288,7 @@ pub struct ConsolidationRequest {
 // TODO: consider not using getter(copy) here. Not sure that we need the Result<T, E> instead of Result<&T, E>
 
 #[superstruct(
-    variants(V1, V2, V3, /*V4*/),
+    variants(V1, V2, V3, V4),
     variant_attributes(derive(Serialize, Deserialize, Clone), serde(rename_all = "camelCase"))
 )]
 #[derive(Serialize, Deserialize, Clone)]
@@ -332,22 +327,20 @@ pub struct ExecutionPayload {
     pub block_hash: H256,
     #[serde(with = "ssz_types::serde_utils::list_of_hex_var_list")]
     pub transactions: VariableList<VariableList<u8, U1073741824>, U1048576>, // larger one is max bytes per transaction, smaller one is max transactions per payload
-    #[superstruct(only(V2, V3, /*V4*/))]
+    #[superstruct(only(V2, V3, V4))]
     pub withdrawals: Vec<Withdrawal>,
-    #[superstruct(only(V3, /*V4*/), partial_getter(copy))]
+    #[superstruct(only(V3, V4), partial_getter(copy))]
     #[serde(with = "serde_utils::u64_hex_be")]
     pub blob_gas_used: u64,
-    #[superstruct(only(V3, /*V4*/), partial_getter(copy))]
+    #[superstruct(only(V3, V4), partial_getter(copy))]
     #[serde(with = "serde_utils::u64_hex_be")]
     pub excess_blob_gas: u64,
-    // TODO: this was written based on LH's implem but it seems that ExecutionPayloadV4 isn't going to exist (as of now)
-
-    /*#[superstruct(only(V4))]
-    pub deposit_requests: VariableList<DepositRequest, U8192>,
     #[superstruct(only(V4))]
-    pub withdrawal_requests: VariableList<WithdrawalRequest, U16>,
-    #[superstruct(only(V4))] // TODO: Turn this into a VariableList
-    pub consolidation_requests: Vec<ConsolidationRequest>,*/
+    #[serde(with = "serde_utils::hex_vec")]
+    pub block_access_list: Vec<u8>,
+    #[superstruct(only(V4), partial_getter(copy))]
+    #[serde(with = "serde_utils::u64_hex_be")]
+    pub slot_number: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -355,7 +348,10 @@ pub struct ExecutionPayload {
     withdrawals_root,
     blob_gas_used,
     excess_blob_gas,
-    parent_beacon_block_root
+    parent_beacon_block_root,
+    requests_hash,
+    block_access_list_hash,
+    slot_number
 )),))]
 pub struct ExecutionBlockHeader {
     pub parent_hash: H256,
@@ -378,6 +374,9 @@ pub struct ExecutionBlockHeader {
     pub blob_gas_used: Option<u64>,
     pub excess_blob_gas: Option<u64>,
     pub parent_beacon_block_root: Option<H256>,
+    pub requests_hash: Option<H256>,
+    pub block_access_list_hash: Option<H256>,
+    pub slot_number: Option<u64>,
 }
 
 impl ExecutionBlockHeader {
@@ -413,6 +412,12 @@ impl ExecutionBlockHeader {
             blob_gas_used: rlp_blob_gas_used,
             excess_blob_gas: rlp_excess_blob_gas,
             parent_beacon_block_root: rlp_parent_beacon_block_root,
+            requests_hash: None,
+            block_access_list_hash: payload
+                .block_access_list()
+                .ok()
+                .map(|bal| H256(keccak::keccak256(bal).into())),
+            slot_number: payload.slot_number().ok(),
         }
     }
 }
@@ -477,13 +482,20 @@ pub enum EngineMethod {
     engine_getBlobsV2,
     engine_getBlobsV3,
     engine_getPayloadV5,
+    // amsterdam
+    engine_newPayloadV5,
+    engine_forkchoiceUpdatedV4,
+    engine_getPayloadV6,
+    engine_getPayloadBodiesByHashV2,
+    engine_getPayloadBodiesByRangeV2,
+    engine_getBlobsV4,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RpcRequest {
     pub method: EngineMethod,
     pub params: serde_json::Value,
-    pub id: u64,
+    pub id: serde_json::Value,
     pub jsonrpc: String,
 }
 
@@ -501,7 +513,7 @@ pub struct forkchoiceUpdatedResponse {
 }
 
 #[superstruct(
-    variants(V1, V2, V3, V4, V5),
+    variants(V1, V2, V3, V4, V5, V6),
     variant_attributes(derive(Serialize, Deserialize, Clone), serde(rename_all = "camelCase"))
 )]
 #[derive(Serialize, Deserialize, Clone)]
@@ -512,18 +524,17 @@ pub struct getPayloadResponse {
     #[superstruct(only(V2), partial_getter(rename = "execution_payload_v2"))]
     pub execution_payload: ExecutionPayloadV2,
     #[superstruct(only(V3, V4, V5), partial_getter(rename = "execution_payload_v3"))]
-    // V4 is set to use ExecutionPayloadV3 as of right now and just introduce another attribute to this struct
     pub execution_payload: ExecutionPayloadV3,
-    /*#[superstruct(only(V4), partial_getter(rename = "execution_payload_v4"))]
-    pub execution_payload: ExecutionPayloadV4,*/
+    #[superstruct(only(V6), partial_getter(rename = "execution_payload_v4"))]
+    pub execution_payload: ExecutionPayloadV4,
     #[serde(with = "serde_utils::u256_hex_be")]
-    #[superstruct(partial_getter(copy), only(V2, V3, V4, V5))]
+    #[superstruct(partial_getter(copy), only(V1, V2, V3, V4, V5, V6))]
     pub block_value: U256,
-    #[superstruct(only(V3, V4, V5))]
+    #[superstruct(only(V3, V4, V5, V6))]
     pub blobs_bundle: serde_json::Value,
-    #[superstruct(only(V3, V4, V5), partial_getter(copy))]
+    #[superstruct(only(V3, V4, V5, V6), partial_getter(copy))]
     pub should_override_builder: bool,
-    #[superstruct(only(V4, V5))]
+    #[superstruct(only(V4, V5, V6))]
     pub execution_requests: serde_json::Value,
 }
 
@@ -535,6 +546,7 @@ impl Debug for getPayloadResponse {
             Self::V3(_) => f.debug_tuple("V3").finish(),
             Self::V4(_) => f.debug_tuple("V4").finish(),
             Self::V5(_) => f.debug_tuple("V5").finish(),
+            Self::V6(_) => f.debug_tuple("V6").finish(),
         }
     }
 }
@@ -562,7 +574,7 @@ impl NodeList {
 
     pub fn create_new_nodes(
         self,
-        general_jwt: Option<jsonwebtoken::EncodingKey>,
+        general_jwt: Option<JwtKey>,
         general_timeout: Option<Duration>,
     ) -> Result<Vec<Arc<Node>>, String> {
         let jwt_re = match Regex::new(r"#jwt-secret=([^#]*)") {
@@ -646,5 +658,31 @@ impl NodeList {
         }
 
         Ok(nodeinstances)
+    }
+}
+
+#[cfg(test)]
+mod jwt_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_fresh_tokens_with_the_correct_signature() {
+        let key = JwtKey::from_secret(&[1; 32]);
+        assert!(key.verifies(&format!("Bearer {}", make_jwt(&key).unwrap())));
+        assert!(!key.verifies("Bearer invalid"));
+        assert!(
+            !JwtKey::from_secret(&[2; 32]).verifies(&format!("Bearer {}", make_jwt(&key).unwrap()))
+        );
+        for offset in [-120, 120] {
+            let token = jsonwebtoken::encode(
+                &JWT_HEADER,
+                &Claims {
+                    iat: chrono::Utc::now().timestamp() + offset,
+                },
+                &key.encoding,
+            )
+            .unwrap();
+            assert!(!key.verifies(&format!("Bearer {}", token)));
+        }
     }
 }

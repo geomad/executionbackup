@@ -5,7 +5,6 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Router,
 };
-use ethereum_types::{H256, U256};
 use futures::future::join_all;
 
 use node::NodeHealth;
@@ -24,262 +23,129 @@ use verify_hash::verify_payload_block_hash;
 
 const VERSION: &str = "1.2.0";
 
-pub fn fork_name_at_epoch(epoch: u64, fork_config: &ForkConfig) -> ForkName {
-    if epoch >= fork_config.osaka_fork_epoch {
-        return ForkName::Osaka;
-    }
-
-    if epoch >= fork_config.prague_fork_epoch {
-        return ForkName::Prague;
-    }
-
-    if epoch >= fork_config.cancun_fork_epoch {
-        return ForkName::Cancun;
-    }
-
-    if epoch >= fork_config.shanghai_fork_epoch {
-        return ForkName::Shanghai;
-    }
-    ForkName::Merge
-}
-
-fn timestamp_to_version(timestamp: &u64, fork_config: &ForkConfig) -> Option<ForkName> {
-    // 32 slots/epoch
-    let slot = timestamp.checked_sub(1606824000)?.checked_div(12)?; // genesis time / seconds per slot
-    let epoch = slot.checked_div(32)?; // slot / slots per epoch
-    Some(fork_name_at_epoch(epoch, fork_config))
-}
-
-pub fn newpayload_serializer(
-    mut request: RpcRequest,
-    fork_config: &ForkConfig,
-) -> Result<NewPayloadRequest, String> {
-    let params = match request.params.as_array_mut() {
-        Some(params_vec) => params_vec,
-        None => {
-            return Err("Could not serialize newPayload's params into a vec".to_string());
-        }
+// Select payload schemas by Engine API version. Fork activation and network
+// configuration belong to the CL/EL; mainnet epoch arithmetic breaks testnets.
+fn parse_new_payload(request: &RpcRequest) -> Result<NewPayloadRequest, String> {
+    let params = request
+        .params
+        .as_array()
+        .ok_or("Expected positional params")?;
+    let count = match request.method {
+        EngineMethod::engine_newPayloadV1 | EngineMethod::engine_newPayloadV2 => 1,
+        EngineMethod::engine_newPayloadV3 => 3,
+        EngineMethod::engine_newPayloadV4 | EngineMethod::engine_newPayloadV5 => 4,
+        _ => return Err("Expected newPayload method".into()),
     };
-
-    if request.method == EngineMethod::engine_newPayloadV3
-        || request.method == EngineMethod::engine_newPayloadV4
-    {
-        // params will have possibly fields: [ExecutionPayloadV3, expectedBlobVersionedHashes, ParentBeaconBlockRoot, executionRequests (for V4)]
-        if params.len() < 3 {
-            return Err("newPayloadV3|4's params did not have at least 3 elements.".to_string());
-        }
-
-        // newPayloadV4 uses ExecutionPayloadV3 just like newPayloadV3
-        let execution_payload: ExecutionPayloadV3 = match serde_json::from_value(params[0].take()) {
-            // direct getting is safe here since we checked that we have least 3 elements
-            Ok(execution_payload) => execution_payload,
-            Err(e) => {
-                tracing::error!(
-                    "Could not serialize ExecutionPayload from newPayloadV3: {}",
-                    e
-                );
-                return Err("Could not serialize ExecutionPayload".to_string());
-            }
-        };
-        /*else {
-            ExecutionPayload::V4(match serde_json::from_value(params[0].take()) {
-                // direct getting is safe here since we checked that we have least 3 elements
-                Ok(execution_payload) => execution_payload,
-                Err(e) => {
-                    tracing::error!(
-                        "Could not serialize ExecutionPayload from newPayloadV4: {}",
-                        e
-                    );
-                    return Err("Could not serialize ExecutionPayload".to_string());
-                }
-            })
-        };*/
-
-        let versioned_hashes: Vec<H256> = match serde_json::from_value(params[1].take()) {
-            Ok(versioned_hashes) => versioned_hashes,
-            Err(e) => {
-                tracing::error!(
-                    "Could not serialize VersionedHashes from newPayloadV3: {}",
-                    e
-                );
-                return Err("Could not serialize Versioned Hashes.".to_string());
-            }
-        };
-
-        let parent_beacon_block_root: H256 = match serde_json::from_value(params[2].take()) {
-            Ok(parent_beacon_block_root) => parent_beacon_block_root,
-            Err(e) => {
-                tracing::error!(
-                    "Could not serialize ParentBeaconBlockRoot from newPayloadV3: {}",
-                    e
-                );
-                return Err("Could not serialize ParentBeaconBlockRoot.".to_string());
-            }
-        };
-
-        let mut execution_requests: Option<Vec<String>> = None;
-
-        if request.method == EngineMethod::engine_newPayloadV4 {
-            if params.len() != 4 {
-                tracing::error!("newPayloadV4 does not have 4 params");
-                return Err("newPayloadV4 does not have 4 params".to_string());
-            }
-
-            execution_requests = Some(match serde_json::from_value(params[3].take()) {
-                Ok(er) => er,
-                Err(e) => {
-                    tracing::error!("Could not get ExecutionRequests from newPayloadV4: {}", e);
-                    return Err("Could not get ExecutionRequests.".to_string());
-                }
-            });
-        }
-
-        return Ok(NewPayloadRequest {
-            execution_payload: ExecutionPayload::V3(execution_payload),
-            expected_blob_versioned_hashes: Some(versioned_hashes),
-            parent_beacon_block_root: Some(parent_beacon_block_root),
-            execution_requests,
-        });
+    if params.len() != count {
+        return Err(format!(
+            "Expected {} params for {:?}",
+            count, request.method
+        ));
     }
-
-    // parmas will just have [ExecutionPayloadV1 | ExecutionPayloadV2]
-
-    if params.len() != 1 {
-        tracing::error!("newPayloadV1|2's params did not have anything or something went wrong (newPayloadV1|2 called with more than just 1 param (ExecutionPayload).");
-        return Err("newPayloadV1|2's params did not have anything.".to_string());
+    let execution_payload = match request.method {
+        EngineMethod::engine_newPayloadV1 => {
+            serde_json::from_value::<ExecutionPayloadV1>(params[0].clone())
+                .map(ExecutionPayload::V1)
+        }
+        EngineMethod::engine_newPayloadV2 if params[0]["withdrawals"].is_null() => {
+            serde_json::from_value::<ExecutionPayloadV1>(params[0].clone())
+                .map(ExecutionPayload::V1)
+        }
+        EngineMethod::engine_newPayloadV2 => {
+            serde_json::from_value::<ExecutionPayloadV2>(params[0].clone())
+                .map(ExecutionPayload::V2)
+        }
+        EngineMethod::engine_newPayloadV5 => {
+            serde_json::from_value::<ExecutionPayloadV4>(params[0].clone())
+                .map(ExecutionPayload::V4)
+        }
+        _ => serde_json::from_value::<ExecutionPayloadV3>(params[0].clone())
+            .map(ExecutionPayload::V3),
     }
-
-    let QuantityU64 { value: timestamp } = match params[0].get("timestamp") {
-        Some(timestamp) => {
-            match serde_json::from_value(timestamp.clone()) {
-                Ok(timestamp) => timestamp,
-                Err(e) => {
-                    tracing::error!("Execution payload timestamp is not representable as u64: {}. Timestamp: {}", e, timestamp);
-                    return Err(
-                        "Execution payload timestamp is not representable as u64".to_string()
-                    );
-                }
-            }
-        }
-        None => {
-            tracing::error!("Execution payload does not have timestamp");
-            return Err("Execution payload does not have timestamp".to_string());
-        }
-    };
-
-    let fork_name = match timestamp_to_version(&timestamp, fork_config) {
-        Some(fork_name) => fork_name,
-        None => {
-            tracing::error!("Error converting execution payload timestamp to fork name");
-            return Err("Error converting execution payload timestamp to fork name".to_string());
-        }
-    };
-
-    let execution_payload = match fork_name {
-        ForkName::Merge => match serde_json::from_value::<ExecutionPayloadV1>(params[0].take()) {
-            Ok(execution_payload) => ExecutionPayload::V1(execution_payload),
-            Err(e) => {
-                tracing::error!(
-                        "Could not serialize ExecutionPayloadV1 from newPayloadV1|2; Merge fork. Error: {}",
-                        e
-                    );
-                return Err("Could not serialize ExecutionPayload.".to_string());
-            }
-        },
-        ForkName::Shanghai => {
-            match serde_json::from_value::<ExecutionPayloadV2>(params[0].take()) {
-                Ok(execution_payload) => ExecutionPayload::V2(execution_payload),
-                Err(e) => {
-                    tracing::error!(
-                        "Could not serialize ExecutionPayloadV2 from newPayloadV2; Shanghai fork. Error: {}",
-                        e
-                    );
-                    return Err("Could not serialize ExecutionPayload.".to_string());
-                }
-            }
-        }
-        ForkName::Cancun => unreachable!("File an issue on github. This should never happen. Matched Cancun fork name even though didn't match previous if newPayloadV3 or params.len != 1."),
-        ForkName::Prague => unreachable!("File an issue on github. This should never happen. Matched Prague fork name even though didn't match previous if newPayloadV3 or params.len != 1."),
-        ForkName::Osaka => unreachable!("File an issue on github. This should never happen. Matched Osaka fork name even though didn't match previous if newPayloadV3 or params.len != 1."),
-    };
-
-    Ok(NewPayloadRequest {
+    .map_err(|e| e.to_string())?;
+    let mut parsed = NewPayloadRequest {
         execution_payload,
         expected_blob_versioned_hashes: None,
         parent_beacon_block_root: None,
         execution_requests: None,
-    })
+    };
+    if count >= 3 {
+        parsed.expected_blob_versioned_hashes =
+            Some(serde_json::from_value(params[1].clone()).map_err(|e| e.to_string())?);
+        parsed.parent_beacon_block_root =
+            Some(serde_json::from_value(params[2].clone()).map_err(|e| e.to_string())?);
+    }
+    if count == 4 {
+        let requests: Vec<String> =
+            serde_json::from_value(params[3].clone()).map_err(|e| e.to_string())?;
+        let mut previous = None;
+        for request in &requests {
+            let bytes = hex::decode(
+                request
+                    .strip_prefix("0x")
+                    .ok_or("Execution request must be DATA")?,
+            )
+            .map_err(|e| e.to_string())?;
+            if bytes.len() <= 1 || previous.is_some_and(|prev| prev >= bytes[0]) {
+                return Err(
+                    "Execution requests must have data and unique types in ascending order".into(),
+                );
+            }
+            previous = Some(bytes[0]);
+        }
+        parsed.execution_requests = Some(requests);
+    }
+    Ok(parsed)
 }
 
-fn make_response(id: &u64, result: serde_json::Value) -> String {
+fn make_response(id: &impl serde::Serialize, result: serde_json::Value) -> String {
     json!({"jsonrpc":"2.0","id":id,"result":result}).to_string()
 }
 
-fn make_error(id: &u64, error: &str) -> String {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32700, "message": error}}).to_string()
+fn rpc_error(id: &impl serde::Serialize, code: i32, message: &str) -> String {
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}).to_string()
 }
 
-fn make_syncing_str(
-    id: &u64,
-    payload: &serde_json::Value,
-    method: &EngineMethod,
-    parent_beacon_block_root: Option<H256>,
-) -> String {
-    match method {
-        EngineMethod::engine_newPayloadV1 | EngineMethod::engine_newPayloadV2 | EngineMethod::engine_newPayloadV3 => {
-            tracing::debug!(
-                "Verifying execution payload blockhash {}.",
-                payload["blockHash"]
-            );
+fn make_error(id: &impl serde::Serialize, error: &str) -> String {
+    rpc_error(id, -32603, error)
+}
 
-            let execution_payload = match method {
-                EngineMethod::engine_newPayloadV1 => match serde_json::from_value::<ExecutionPayloadV1>(payload.clone()) {
-                        Ok(execution_payload) => ExecutionPayload::V1(execution_payload),
-                        Err(e) => {
-                            tracing::error!("Error deserializing execution payload: {}", e);
-                            return e.to_string();
-                        }
-                    },
-
-                EngineMethod::engine_newPayloadV2 => match serde_json::from_value::<ExecutionPayloadV2>(payload.clone()) {
-                        Ok(execution_payload) => ExecutionPayload::V2(execution_payload),
-                        Err(e) => {
-                            tracing::error!("Error deserializing execution payload: {}", e);
-                            return e.to_string();
-                        }
-                    },
-
-                EngineMethod::engine_newPayloadV3 => match serde_json::from_value::<ExecutionPayloadV3>(payload.clone()) {
-                        Ok(execution_payload) => ExecutionPayload::V3(execution_payload),
-                        Err(e) => {
-                            tracing::error!("Error deserializing execution payload: {}", e);
-                            return e.to_string();
-                        }
-                    },
-                _ => unreachable!("File a issue on Github. This should never happen. Matched non-newPayload inside previously matched newPayload"),
+fn make_syncing_str(request: &RpcRequest, payload: Option<&NewPayloadRequest>) -> String {
+    if let Some(payload) = payload {
+        if let Err(error) = verify_payload_block_hash(
+            &payload.execution_payload,
+            payload.parent_beacon_block_root,
+            payload.execution_requests.as_deref(),
+        ) {
+            let status = if request.method == EngineMethod::engine_newPayloadV1 {
+                "INVALID_BLOCK_HASH"
+            } else {
+                "INVALID"
             };
-
-            if let Err(e) = verify_payload_block_hash(&execution_payload, parent_beacon_block_root) {
-                tracing::error!("Error verifying execution payload blockhash: {}", e);
-                return e.to_string();
-            }
-
-            tracing::debug!(
-                "Execution payload blockhash {} verified. Returning SYNCING",
-                payload["blockHash"]
+            return make_response(
+                &request.id,
+                json!({"status": status, "latestValidHash": null, "validationError": error.to_string()}),
             );
-            json!({"result":{"latestValidHash":null,"status":"SYNCING","validationError":null},"id":id,"jsonrpc":"2.0"}).to_string()
-        },
-
-        EngineMethod::engine_forkchoiceUpdatedV1 | EngineMethod::engine_forkchoiceUpdatedV2 | EngineMethod::engine_forkchoiceUpdatedV3 => {
-            json!({"jsonrpc":"2.0","id":id,"result":{"payloadStatus":{"status":"SYNCING","latestValidHash":null,"validationError":null}},"payloadId":null}).to_string()
-        },
-
-        _ => {
-            "Called make_syncing_str with a non fcu or newpayload request".to_string()
         }
+        make_response(&request.id, json!(PayloadStatusV1::new_syncing()))
+    } else {
+        make_response(
+            &request.id,
+            json!(forkchoiceUpdatedResponse {
+                payloadStatus: PayloadStatusV1::new_syncing(),
+                payloadId: None,
+            }),
+        )
     }
 }
+
+struct PayloadBuild {
+    created: std::time::Instant,
+    nodes: Vec<PayloadIdNode>,
+}
+
+const PAYLOAD_CACHE_TTL: Duration = Duration::from_secs(120);
+const MAX_PAYLOAD_BUILDS: usize = 1024;
 
 struct NodeRouter {
     nodes: Arc<Mutex<Vec<Arc<Node>>>>,
@@ -290,33 +156,37 @@ struct NodeRouter {
     // this node will be the selected primary node used to route all requests
     primary_node: Arc<RwLock<Arc<Node>>>,
 
-    // jwt encoded key used to make tokens for the EE's auth port
-    // jwt_key: Arc<jsonwebtoken::EncodingKey>,
-
     // percentage of nodes that need to agree for it to be deemed a majority
     majority_percentage: f32, // 0.1..0.9
 
-    payload_ids: Mutex<HashMap<String, Vec<PayloadIdNode>>>,
+    payload_ids: Mutex<HashMap<String, PayloadBuild>>,
 
     // setting to set if node timings are displayed
     node_timings_enabled: bool,
 
-    fork_config: ForkConfig,
-
     // for if we want to use a general jwt with /create_node
-    general_jwt: Option<jsonwebtoken::EncodingKey>,
+    general_jwt: Option<JwtKey>,
     general_timeout: Option<Duration>,
 }
 
 impl NodeRouter {
+    async fn authenticates(&self, authorization: &str) -> bool {
+        if let Some(key) = &self.general_jwt {
+            return key.verifies(authorization);
+        }
+        self.nodes
+            .lock()
+            .await
+            .iter()
+            .any(|node| node.jwt_key.verifies(authorization))
+    }
+
     fn new(
-        //jwt_key: &jsonwebtoken::EncodingKey,
         majority_percentage: f32,
         nodes: Vec<Arc<Node>>,
         primary_node: Arc<Node>,
         node_timings_enabled: bool,
-        fork_config: ForkConfig,
-        general_jwt: Option<jsonwebtoken::EncodingKey>,
+        general_jwt: Option<JwtKey>,
         general_timeout: Option<Duration>,
     ) -> Self {
         NodeRouter {
@@ -328,36 +198,17 @@ impl NodeRouter {
             payload_ids: Mutex::new(HashMap::new()),
             majority_percentage,
             node_timings_enabled,
-            fork_config,
             general_jwt,
             general_timeout,
         }
-    }
-
-    async fn make_node_syncing(&self, node: Arc<Node>) {
-        let mut alive_nodes = self.alive_nodes.write().await;
-        let index = alive_nodes.iter().position(|x| *x.url == node.url);
-        let index = match index {
-            Some(index) => index,
-            None => {
-                // node is not in alive_nodes, so it's in syncing or worse, stop here
-                return;
-            }
-        };
-
-        let mut alive_but_syncing_nodes = self.alive_but_syncing_nodes.write().await;
-        alive_nodes.remove(index);
-        alive_but_syncing_nodes.push(node.clone());
-        node.set_online_and_syncing().await;
     }
 
     // returns Vec<T> where it tries to deserialize for each resp to T
     async fn concurrent_requests<T>(
         &self,
         request: &RpcRequest,
-        jwt_token: String,
         use_syncing_nodes: bool,
-    ) -> Vec<(Arc<Node>, T)>
+    ) -> (Vec<(Arc<Node>, T)>, Option<serde_json::Value>)
     where
         T: serde::de::DeserializeOwned,
     {
@@ -375,13 +226,14 @@ impl NodeRouter {
         nodes.iter().for_each(|node| {
             futs.push(async {
                 let start = std::time::Instant::now();
-                let response = node.do_request(request, jwt_token.clone()).await;
+                let response = node.do_request(request).await;
                 let resp_time = start.elapsed().as_millis();
                 (response, node.clone(), resp_time)
             })
         });
 
         let mut out = Vec::with_capacity(nodes.len());
+        let mut rpc_failure = None;
         let completed: Vec<(Result<String, reqwest::Error>, Arc<Node>, u128)> =
             join_all(futs).await;
 
@@ -393,7 +245,15 @@ impl NodeRouter {
             );
             match resp_nodeurl_timing.0 {
                 Ok(resp_string) => {
-                    // response from node
+                    // Preserve protocol errors when no EL can process this version.
+                    if let Ok(response) = serde_json::from_str::<serde_json::Value>(&resp_string) {
+                        if let Some(error) = response.get("error") {
+                            if rpc_failure.is_none() {
+                                rpc_failure = Some(error.clone());
+                            }
+                            continue;
+                        }
+                    }
                     let result = match parse_result(&resp_string) {
                         Ok(result) => result,
                         Err(e) => {
@@ -433,7 +293,7 @@ impl NodeRouter {
             }
         }
 
-        out
+        (out, rpc_failure)
     }
 
     async fn recheck(&self) {
@@ -501,7 +361,7 @@ impl NodeRouter {
         }
 
         // sort alive_nodes by response time
-        new_alive_nodes.sort_by(|a, b| a.0.cmp(&b.0));
+        new_alive_nodes.sort_by_key(|node| node.0);
 
         // update primary node to be the first alive node
         let mut primary_node = self.primary_node.write().await;
@@ -604,11 +464,8 @@ impl NodeRouter {
         }
     }
 
-    // gets the majority response from a vector of respon   ses
-    // must have at least majority_percentage of the nodes agree
-    // if there is no majority, then return None
-    // if there is a draw, just return the first response
-    // u64 on the response should be the "id" field from the any of the responses
+    // Return the most common status when it meets the configured threshold.
+    // Ties have no majority, regardless of hash-map iteration order.
     fn fcu_majority(&self, results: &mut [PayloadStatusV1]) -> Option<PayloadStatusV1> {
         let total_responses = results.len();
         let majority_count = (total_responses as f32 * self.majority_percentage).round() as usize;
@@ -629,12 +486,20 @@ impl NodeRouter {
         // Find the response with the most occurrences
         let mut majority_response = None;
         let mut max_count = 0;
+        let mut tied = false;
 
         for (response, count) in response_counts.into_iter() {
             if count > max_count {
                 majority_response = Some(response);
                 max_count = count;
+                tied = false;
+            } else if count == max_count {
+                tied = true;
             }
+        }
+
+        if tied {
+            return None;
         }
 
         // Check if the majority count is greater than or equal to the required count
@@ -663,11 +528,9 @@ impl NodeRouter {
         &self,
         resps: &mut Vec<PayloadStatusV1>,
         req: &RpcRequest,
-        jwt_token: String,
     ) -> Result<PayloadStatusV1, FcuLogicError> {
         // send to the syncing nodes to help them catch up with tokio::spawn so we don't have to wait for them
         let syncing_nodes = self.alive_but_syncing_nodes.clone();
-        let jwt_token_clone = jwt_token.clone();
         let req_clone = req.clone();
         tokio::spawn(async move {
             let syncing_nodes = syncing_nodes.read().await.clone();
@@ -683,7 +546,7 @@ impl NodeRouter {
             join_all(
                 syncing_nodes
                     .iter()
-                    .map(|node| node.do_request_no_timeout(&req_clone, jwt_token_clone.clone())),
+                    .map(|node| node.do_request_no_timeout(&req_clone)),
             )
             .await;
         });
@@ -733,436 +596,286 @@ impl NodeRouter {
         Ok(majority)
     }
 
-    async fn do_engine_route(
-        &self,
-        fork_config: &ForkConfig,
-        request: &RpcRequest,
-        jwt_token: String,
-    ) -> (String, u16) {
+    async fn do_engine_route(&self, request: &RpcRequest) -> (String, u16) {
         match request.method {
-            // getPayloadV1 is for getting a block to be proposed, so no use in getting from multiple nodes
-            EngineMethod::engine_getPayloadV1 => {
-                let node = match self.get_execution_node().await {
-                    None => {
-                        return (make_error(&request.id, "No nodes available"), 500);
-                    }
-                    Some(node) => node,
-                };
-
-                let resp = node.do_request_no_timeout(request, jwt_token).await; // no timeout since the CL will just time us out themselves
-                tracing::debug!("engine_getPayloadV1 sent to node: {}", node.url);
-                match resp {
-                    Ok(resp) => (resp, 200),
-                    Err(e) => {
-                        tracing::warn!("engine_getPayloadV1 error: {}", e);
-
-                        if e.is_connect() || e.is_timeout() || e.is_request() {
-                            // if the error is a connection error, then we should set the node to syncing
-                            self.make_node_syncing(node.clone()).await;
-                        }
-
-                        (make_error(&request.id, &e.to_string()), 200)
-                    }
-                }
-            } // getPayloadV1
-
-            EngineMethod::engine_getPayloadV2
+            EngineMethod::engine_getPayloadV1
+            | EngineMethod::engine_getPayloadV2
             | EngineMethod::engine_getPayloadV3
             | EngineMethod::engine_getPayloadV4
-            | EngineMethod::engine_getPayloadV5 => {
-                let cl_payload_id = request.params.as_array().unwrap()[0]
-                    .as_str()
-                    .unwrap()
-                    .to_owned();
-
-                let specific_node_payloads =
-                    match self.payload_ids.lock().await.remove(&cl_payload_id) {
-                        Some(snp) => snp,
-                        None => {
-                            return (
-                                make_error(
-                                    &request.id,
-                                    "ExecutionBackup: Couldn't find main payload_id",
-                                ),
-                                200,
-                            )
-                        }
-                    };
-
-                tracing::debug!(
-                    "Got main payload_id {}, fetching individual EL payloads",
-                    cl_payload_id
-                );
-
-                let fork_name = match request.method {
+            | EngineMethod::engine_getPayloadV5
+            | EngineMethod::engine_getPayloadV6 => {
+                let id = request
+                    .params
+                    .as_array()
+                    .filter(|p| p.len() == 1)
+                    .and_then(|p| p[0].as_str())
+                    .filter(|id| {
+                        id.strip_prefix("0x")
+                            .and_then(|v| hex::decode(v).ok())
+                            .is_some_and(|v| v.len() == 8)
+                    });
+                let Some(id) = id else {
+                    return (
+                        rpc_error(&request.id, -32602, "Expected an 8-byte payload ID"),
+                        200,
+                    );
+                };
+                let nodes = {
+                    let mut builds = self.payload_ids.lock().await;
+                    builds.retain(|_, build| build.created.elapsed() < PAYLOAD_CACHE_TTL);
+                    builds.get(id).map(|build| build.nodes.clone())
+                };
+                let Some(nodes) = nodes else {
+                    return (rpc_error(&request.id, -38001, "Unknown payload"), 200);
+                };
+                let fork = match request.method {
                     EngineMethod::engine_getPayloadV1 => ForkName::Merge,
                     EngineMethod::engine_getPayloadV2 => ForkName::Shanghai,
                     EngineMethod::engine_getPayloadV3 => ForkName::Cancun,
                     EngineMethod::engine_getPayloadV4 => ForkName::Prague,
                     EngineMethod::engine_getPayloadV5 => ForkName::Osaka,
-                    _ => unreachable!("File an issue on github. Matched non Engine_getPayload"),
+                    EngineMethod::engine_getPayloadV6 => ForkName::Amsterdam,
+                    _ => unreachable!(),
                 };
-
-                let mut futs = Vec::new();
-                specific_node_payloads
-                    .into_iter()
-                    .for_each(|payload_id_node| {
-                        futs.push(payload_id_node.get_payload(
-                            request.clone(),
-                            jwt_token.clone(),
-                            &fork_name,
-                        ))
-                    });
-                let resps = join_all(futs).await;
-
-                let most_profitable = resps
-                    .iter()
-                    .flatten() // Remove all invalid responses from node
-                    .max_by(|resp_a, resp_b| {
-                        resp_a
-                            .block_value()
-                            .unwrap()
-                            .cmp(&resp_b.block_value().unwrap())
-                    })
-                    .cloned();
-
-                // note: we may want to get the most profitable block from resps that have should_override_builder = true, note this in release
-
-                if let Some(most_profitable_payload) = most_profitable {
-                    let block_number = match request.method {
-                        EngineMethod::engine_getPayloadV2 => {
-                            most_profitable_payload
-                                .execution_payload_v2()
-                                .unwrap()
-                                .block_number
+                let responses = join_all(
+                    nodes
+                        .into_iter()
+                        .map(|node| node.get_payload(request.clone(), &fork)),
+                )
+                .await;
+                let mut best: Option<PayloadCandidate> = None;
+                let mut error = json!({"code": -38001, "message": "Unknown payload"});
+                for response in responses {
+                    match response {
+                        Ok(candidate) => {
+                            let replace = match &best {
+                                Some(best) => candidate.block_value > best.block_value,
+                                None => true,
+                            };
+                            if replace {
+                                best = Some(candidate);
+                            }
                         }
-                        EngineMethod::engine_getPayloadV3 => {
-                            most_profitable_payload
-                                .execution_payload_v3()
-                                .unwrap()
-                                .block_number
-                        }
-                        EngineMethod::engine_getPayloadV4 => {
-                            most_profitable_payload
-                                /*.execution_payload_v4()*/
-                                .execution_payload_v3() // as of now, V4 uses ExecutionPayloadV3
-                                .unwrap()
-                                .block_number
-                        }
-                        _ => {
-                            unreachable!("File an issue on github. This should never happen. Matched non getPayloadV2|3|4 even though previously matched")
-                        }
-                    };
-
-                    tracing::info!("getPayload2|3|4: Block #{} requested by CL. All EL blocks profitability (wei): {:?}. Using payload with value of {} wei", block_number, resps.iter().flatten().map(|payload| payload.block_value().unwrap()).collect::<Vec<U256>>(), most_profitable_payload.block_value().unwrap());
+                        Err(failure) => error = failure,
+                    }
+                }
+                if let Some(best) = best {
+                    tracing::info!(
+                        "{:?}: returning block #{} with value {} wei",
+                        request.method,
+                        best.block_number,
+                        best.block_value
+                    );
+                    (make_response(&request.id, best.result), 200)
+                } else {
+                    (
+                        json!({"jsonrpc":"2.0", "id":request.id, "error":error}).to_string(),
+                        200,
+                    )
+                }
+            }
+            EngineMethod::engine_newPayloadV1
+            | EngineMethod::engine_newPayloadV2
+            | EngineMethod::engine_newPayloadV3
+            | EngineMethod::engine_newPayloadV4
+            | EngineMethod::engine_newPayloadV5 => {
+                let payload = match parse_new_payload(request) {
+                    Ok(payload) => payload,
+                    Err(error) => return (rpc_error(&request.id, -32602, &error), 200),
+                };
+                let (responses, error) = self
+                    .concurrent_requests::<PayloadStatusV1>(request, false)
+                    .await;
+                let mut statuses = responses.into_iter().map(|(_, status)| status).collect();
+                match self.fcu_logic(&mut statuses, request).await {
+                    Ok(status) => (make_response(&request.id, json!(status)), 200),
+                    Err(FcuLogicError::NoResponses) if error.is_some() => (
+                        json!({"jsonrpc":"2.0", "id":request.id, "error":error}).to_string(),
+                        200,
+                    ),
+                    Err(_) => (make_syncing_str(request, Some(&payload)), 200),
+                }
+            }
+            EngineMethod::engine_forkchoiceUpdatedV1
+            | EngineMethod::engine_forkchoiceUpdatedV2
+            | EngineMethod::engine_forkchoiceUpdatedV3
+            | EngineMethod::engine_forkchoiceUpdatedV4 => {
+                let count = if request.method == EngineMethod::engine_forkchoiceUpdatedV4 {
+                    3
+                } else {
+                    2
+                };
+                let Some(params) = request.params.as_array().filter(|p| p.len() == count) else {
                     return (
-                        make_response(&request.id, json!(most_profitable_payload)),
+                        rpc_error(&request.id, -32602, "Invalid forkchoiceUpdated params"),
+                        200,
+                    );
+                };
+                if count == 3
+                    && !params[2].is_null()
+                    && !params[2]
+                        .as_str()
+                        .and_then(|v| v.strip_prefix("0x"))
+                        .and_then(|v| hex::decode(v).ok())
+                        .is_some_and(|v| v.len() == 16)
+                {
+                    return (
+                        rpc_error(
+                            &request.id,
+                            -32602,
+                            "custodyColumns must be 16-byte DATA or null",
+                        ),
                         200,
                     );
                 }
-
-                // we have no payloads
-                tracing::error!("No blocks found in EL engine_getPayloadV2|3|4 responses");
-                (
-                    make_error(
-                        &request.id,
-                        "No blocks found in EL engine_getPayloadV2|3|4 responses",
-                    ),
-                    200,
-                )
-            } // getPayloadV2,3,4
-
-            EngineMethod::engine_newPayloadV1 | EngineMethod::engine_newPayloadV2 => {
-                tracing::debug!("Sending newPayloadV1|2 to alive nodes");
-                let mut resps: Vec<PayloadStatusV1> = self
-                    .concurrent_requests::<PayloadStatusV1>(request, jwt_token.clone(), false)
-                    .await
-                    .iter()
-                    .map(|x| x.1.clone())
-                    .collect();
-
-                let resp = match self.fcu_logic(&mut resps, request, jwt_token).await {
-                    Ok(resp) => resp,
-                    Err(e) => match e {
-                        FcuLogicError::NoResponses => {
-                            tracing::error!(
-                                "No responses for {:?}, returning SYNCING",
-                                request.method
-                            );
-                            return (
-                                make_syncing_str(
-                                    &request.id,
-                                    &request.params[0],
-                                    &request.method,
-                                    None,
-                                ),
-                                200,
-                            );
-                        }
-                        FcuLogicError::NoMajority => {
-                            tracing::error!(
-                                "No majority for {:?}, returning SYNCING",
-                                request.method
-                            );
-                            return (
-                                make_syncing_str(
-                                    &request.id,
-                                    &request.params[0],
-                                    &request.method,
-                                    None,
-                                ),
-                                200,
-                            );
-                        }
-                        FcuLogicError::OneNodeIsInvalid => {
-                            tracing::error!(
-                                "One node is invalid for {:?}, returning SYNCING",
-                                request.method
-                            );
-                            return (
-                                make_syncing_str(
-                                    &request.id,
-                                    &request.params[0],
-                                    &request.method,
-                                    None,
-                                ),
-                                200,
-                            );
-                        }
-                    },
-                };
-
-                // we have a majority
-                (make_response(&request.id, json!(resp)), 200)
-            } // newPayloadV1,2
-
-            EngineMethod::engine_newPayloadV3 | EngineMethod::engine_newPayloadV4 => {
-                let newpayload_request = match newpayload_serializer(request.clone(), fork_config) {
-                    Ok(newpayload_request) => newpayload_request,
-                    Err(e) => {
-                        tracing::error!("Failed to serialize newPayloadV3|4: {}", e);
-                        return ("Failed to serialize newPayloadV3|4".to_string(), 500);
-                    }
-                };
-
-                tracing::debug!("Sending newPayloadV3|4 to alive nodes");
-                let mut resps: Vec<PayloadStatusV1> = self
-                    .concurrent_requests::<PayloadStatusV1>(request, jwt_token.clone(), false)
-                    .await
-                    .iter()
-                    .map(|x| x.1.clone())
-                    .collect();
-
-                let resp = match self.fcu_logic(&mut resps, request, jwt_token).await {
-                    Ok(resp) => resp,
-                    Err(e) => match e {
-                        FcuLogicError::NoResponses => {
-                            tracing::error!(
-                                "No responses for {:?}, returning SYNCING",
-                                request.method
-                            );
-                            return (
-                                make_syncing_str(
-                                    &request.id,
-                                    &request.params[0],
-                                    &request.method,
-                                    newpayload_request.parent_beacon_block_root,
-                                ),
-                                200,
-                            );
-                        }
-                        FcuLogicError::NoMajority => {
-                            tracing::error!(
-                                "No majority for {:?}, returning SYNCING",
-                                request.method
-                            );
-                            return (
-                                make_syncing_str(
-                                    &request.id,
-                                    &request.params[0],
-                                    &request.method,
-                                    newpayload_request.parent_beacon_block_root,
-                                ),
-                                200,
-                            );
-                        }
-                        FcuLogicError::OneNodeIsInvalid => {
-                            tracing::error!(
-                                "One node is invalid for {:?}, returning SYNCING",
-                                request.method
-                            );
-                            return (
-                                make_syncing_str(
-                                    &request.id,
-                                    &request.params[0],
-                                    &request.method,
-                                    newpayload_request.parent_beacon_block_root,
-                                ),
-                                200,
-                            );
-                        }
-                    },
-                };
-
-                // we have a majority
-                (make_response(&request.id, json!(resp)), 200)
-            } // newPayloadV3|4
-
-            EngineMethod::engine_forkchoiceUpdatedV1
-            | EngineMethod::engine_forkchoiceUpdatedV2
-            | EngineMethod::engine_forkchoiceUpdatedV3 => {
-                tracing::debug!("Sending fcU to alive nodes");
-                let resps: Vec<(Arc<Node>, forkchoiceUpdatedResponse)> = self
-                    .concurrent_requests(request, jwt_token.clone(), false)
+                // Forward all params intact, including custodyColumns even with null attributes.
+                let (responses, error) = self
+                    .concurrent_requests::<forkchoiceUpdatedResponse>(request, false)
                     .await;
-
-                let mut payloadstatus_resps: Vec<PayloadStatusV1> =
-                    resps.iter().map(|x| x.1.payloadStatus.clone()).collect();
-                let mut main_payload_id: Option<String> = None;
-
-                // Check that payloadAttributes is not null
-                if !request.params.as_array().unwrap()[1].is_null() {
-                    tracing::info!("CL sent payloadAttributes, wants to build a payload");
-                    // Since resps have different payload_ids, we will create our own, which we return to all CLs.
-                    // When the CL calls getPayload, they will provide this main payload_id we created, and we can fetch the result with the per-EL payload_id.
-
-                    let mut payload_id_bytes = [0; 8];
-                    rand::thread_rng().fill_bytes(&mut payload_id_bytes);
-                    main_payload_id = Some(format!("0x{}", hex::encode(payload_id_bytes)));
-
-                    // Get the nodes and it's respective payload_id together
-                    let payloadid_nodes: Vec<PayloadIdNode> = resps
-                        .iter()
-                        .map(|resp| PayloadIdNode {
-                            node: resp.0.clone(),
-                            payload_id: resp.1.payloadId.clone().unwrap(),
+                let mut statuses = responses
+                    .iter()
+                    .map(|(_, response)| response.payloadStatus.clone())
+                    .collect();
+                let status = match self.fcu_logic(&mut statuses, request).await {
+                    Ok(status) => status,
+                    Err(FcuLogicError::NoResponses) if error.is_some() => {
+                        return (
+                            json!({"jsonrpc":"2.0", "id":request.id, "error":error}).to_string(),
+                            200,
+                        )
+                    }
+                    Err(_) => return (make_syncing_str(request, None), 200),
+                };
+                let mut payload_id = None;
+                if !params[1].is_null() && status.status == PayloadStatusV1Status::Valid {
+                    let nodes: Vec<_> = responses
+                        .into_iter()
+                        .filter_map(|(node, response)| {
+                            if response.payloadStatus.status != PayloadStatusV1Status::Valid {
+                                return None;
+                            }
+                            response
+                                .payloadId
+                                .filter(|id| {
+                                    id.strip_prefix("0x")
+                                        .and_then(|v| hex::decode(v).ok())
+                                        .is_some_and(|v| v.len() == 8)
+                                })
+                                .map(|payload_id| PayloadIdNode { node, payload_id })
                         })
                         .collect();
-
-                    let total_unique_payload_ids = payloadid_nodes.len();
-
-                    self.payload_ids
-                        .lock()
-                        .await
-                        .insert(main_payload_id.clone().unwrap(), payloadid_nodes);
-
-                    tracing::debug!(
-                        "Stored {} unique payload_ids, gave CL main payload_id: {}",
-                        total_unique_payload_ids,
-                        main_payload_id.clone().unwrap()
-                    );
+                    if !nodes.is_empty() {
+                        let mut builds = self.payload_ids.lock().await;
+                        builds.retain(|_, build| build.created.elapsed() < PAYLOAD_CACHE_TTL);
+                        if builds.len() >= MAX_PAYLOAD_BUILDS {
+                            if let Some(oldest) = builds
+                                .iter()
+                                .min_by_key(|(_, build)| build.created)
+                                .map(|(id, _)| id.clone())
+                            {
+                                builds.remove(&oldest);
+                            }
+                        }
+                        let id = loop {
+                            let mut bytes = [0; 8];
+                            rand::thread_rng().fill_bytes(&mut bytes);
+                            let id = format!("0x{}", hex::encode(bytes));
+                            if !builds.contains_key(&id) {
+                                break id;
+                            }
+                        };
+                        builds.insert(
+                            id.clone(),
+                            PayloadBuild {
+                                created: std::time::Instant::now(),
+                                nodes,
+                            },
+                        );
+                        payload_id = Some(id);
+                    }
                 }
-
-                let resp = match self
-                    .fcu_logic(&mut payloadstatus_resps, request, jwt_token)
-                    .await
-                {
-                    Ok(resp) => resp,
-                    Err(e) => match e {
-                        FcuLogicError::NoResponses => {
-                            tracing::error!(
-                                "No responses for {:?}, returning SYNCING",
-                                request.method
-                            );
-                            return (
-                                make_syncing_str(
-                                    &request.id,
-                                    &request.params[0],
-                                    &request.method,
-                                    None,
-                                ),
-                                200,
-                            );
-                        }
-                        FcuLogicError::NoMajority => {
-                            tracing::error!(
-                                "No majority for {:?}, returning SYNCING",
-                                request.method
-                            );
-                            return (
-                                make_syncing_str(
-                                    &request.id,
-                                    &request.params[0],
-                                    &request.method,
-                                    None,
-                                ),
-                                200,
-                            );
-                        }
-                        FcuLogicError::OneNodeIsInvalid => {
-                            tracing::error!(
-                                "One node is invalid for {:?}, returning SYNCING",
-                                request.method
-                            );
-                            return (
-                                make_syncing_str(
-                                    &request.id,
-                                    &request.params[0],
-                                    &request.method,
-                                    None,
-                                ),
-                                200,
-                            );
-                        }
-                    },
-                };
-
-                // we have a majority
                 (
                     make_response(
                         &request.id,
                         json!(forkchoiceUpdatedResponse {
-                            payloadStatus: resp,
-                            payloadId: main_payload_id,
+                            payloadStatus: status,
+                            payloadId: payload_id
                         }),
                     ),
                     200,
                 )
-            } // fcU V1, V2, V3
-
-            EngineMethod::engine_getClientVersionV1 => {
-                let resps: Vec<serde_json::Value> = self
-                    .concurrent_requests::<serde_json::Value>(request, jwt_token, true)
+            }
+            EngineMethod::engine_exchangeCapabilities => {
+                // Intersect responding voting ELs and methods understood here. An
+                // offline EL must not disable the capabilities of working backups.
+                let nodes: Vec<_> = self
+                    .nodes
+                    .lock()
                     .await
                     .iter()
-                    .map(|x| x.1.clone())
-                    .collect(); // send to syncing nodes too
-                (make_response(&request.id, json!(resps)), 200)
-            }
-
-            EngineMethod::engine_exchangeTransitionConfigurationV1
-            | EngineMethod::engine_exchangeCapabilities
-            | EngineMethod::engine_getPayloadBodiesByHashV1
-            | EngineMethod::engine_getPayloadBodiesByRangeV1
-            | EngineMethod::engine_getBlobsV1
-            | EngineMethod::engine_getBlobsV2
-            | EngineMethod::engine_getBlobsV3 => {
-                // Send to primary node
-                let primary_node = match self.get_execution_node().await {
-                    Some(primary_node) => primary_node,
-                    None => {
-                        tracing::warn!("No primary node available");
-                        return (make_error(&request.id, "No nodes available"), 500);
-                    }
-                };
-
-                let resp = primary_node
-                    .do_request_no_timeout(request, jwt_token.clone())
-                    .await;
-
-                // Return resp from primary node
-                match resp {
-                    Ok(resp) => (resp, 200),
-                    Err(e) => {
-                        tracing::warn!("Error from primary node: {}", e);
-                        (make_error(&request.id, &e.to_string()), 200)
+                    .filter(|n| !n.do_not_use)
+                    .cloned()
+                    .collect();
+                let replies = join_all(nodes.iter().map(|node| node.do_request(request))).await;
+                let mut common: Option<Vec<String>> = None;
+                for reply in replies {
+                    let Ok(body) = reply else {
+                        continue;
+                    };
+                    let methods = parse_result(&body)
+                        .ok()
+                        .and_then(|result| serde_json::from_value::<Vec<String>>(result).ok())
+                        .unwrap_or_default();
+                    let supported: Vec<_> = methods
+                        .into_iter()
+                        .filter(|name| serde_json::from_value::<EngineMethod>(json!(name)).is_ok())
+                        .collect();
+                    match common.as_mut() {
+                        None => common = Some(supported),
+                        Some(common) => common.retain(|name| supported.contains(name)),
                     }
                 }
-            } // all other engine requests*/
+                let mut common = common.unwrap_or_default();
+                common.sort();
+                common.dedup();
+                (make_response(&request.id, json!(common)), 200)
+            }
+            EngineMethod::engine_getClientVersionV1 => {
+                let (responses, _) = self
+                    .concurrent_requests::<Vec<serde_json::Value>>(request, true)
+                    .await;
+                (
+                    make_response(
+                        &request.id,
+                        json!(responses
+                            .into_iter()
+                            .flat_map(|(_, versions)| versions)
+                            .collect::<Vec<_>>()),
+                    ),
+                    200,
+                )
+            }
+            EngineMethod::engine_exchangeTransitionConfigurationV1
+            | EngineMethod::engine_getPayloadBodiesByHashV1
+            | EngineMethod::engine_getPayloadBodiesByRangeV1
+            | EngineMethod::engine_getPayloadBodiesByHashV2
+            | EngineMethod::engine_getPayloadBodiesByRangeV2
+            | EngineMethod::engine_getBlobsV1
+            | EngineMethod::engine_getBlobsV2
+            | EngineMethod::engine_getBlobsV3
+            | EngineMethod::engine_getBlobsV4 => {
+                let Some(node) = self.get_execution_node().await else {
+                    return (make_error(&request.id, "No nodes available"), 200);
+                };
+                match node.do_request_no_timeout(request).await {
+                    Ok(response) => (response, 200),
+                    Err(error) => (make_error(&request.id, &error.to_string()), 200),
+                }
+            }
         }
     }
 
-    async fn do_route_normal(&self, request: String, jwt_token: String) -> (String, u16) {
+    async fn do_route_normal(&self, request: String) -> (String, u16) {
         // simply send request to primary node
         let primary_node = match self.get_execution_node().await {
             Some(primary_node) => primary_node,
@@ -1179,9 +892,7 @@ impl NodeRouter {
             }
         };
 
-        let resp = primary_node
-            .do_request_no_timeout_str(request, jwt_token)
-            .await;
+        let resp = primary_node.do_request_no_timeout_str(request).await;
         match resp {
             Ok(resp) => (resp, 200),
             Err(e) => (make_error(&1, &e.to_string()), 200),
@@ -1202,7 +913,7 @@ async fn route_all(
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(make_error(&0, "Couldn't deserialize request body").to_string())
+                .body(rpc_error(&serde_json::Value::Null, -32700, "Invalid JSON"))
                 .unwrap();
         }
     };
@@ -1214,7 +925,7 @@ async fn route_all(
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(make_error(&0, "Request has no method field").to_string())
+                .body(rpc_error(&j["id"], -32600, "Request has no method field"))
                 .unwrap();
         }
     };
@@ -1229,9 +940,17 @@ async fn route_all(
             Err(e) => {
                 tracing::error!("Error deserializing {} request: {}", j["method"], e);
                 return Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
+                    .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(make_error(&0, "Error deserializing request").to_string())
+                    .body(rpc_error(
+                        &j["id"],
+                        if serde_json::from_value::<EngineMethod>(j["method"].clone()).is_err() {
+                            -32601
+                        } else {
+                            -32602
+                        },
+                        "Unsupported method or invalid request",
+                    ))
                     .unwrap();
             }
         };
@@ -1261,9 +980,17 @@ async fn route_all(
             }
         };
 
-        let (resp, status) = router
-            .do_engine_route(&router.fork_config, &request, jwt_token.to_string())
-            .await;
+        // Backend tokens are signed per node, so authenticate the CL before
+        // substituting any backend credential.
+        if !router.authenticates(jwt_token).await {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(make_error(&request.id, "Invalid or expired JWT"))
+                .unwrap();
+        }
+
+        let (resp, status) = router.do_engine_route(&request).await;
 
         Response::builder()
             .status(status)
@@ -1277,15 +1004,8 @@ async fn route_all(
 
         let jwt_token = headers.get("Authorization");
         if jwt_token.is_none() {
-            let (resp, status) = router
-                .do_route_normal(
-                    body,
-                    format!(
-                        "Bearer {}",
-                        make_jwt(&router.primary_node.read().await.jwt_key).unwrap()
-                    ), // supporting requests without jwt tokens to authrpc is used for OE.
-                ) // open an issue if you need this to be changed
-                .await;
+            // Preserve unauthenticated non-engine RPC support for existing users.
+            let (resp, status) = router.do_route_normal(body).await;
 
             return Response::builder()
                 .status(status)
@@ -1322,7 +1042,14 @@ async fn route_all(
             }
         };
 
-        let (resp, status) = router.do_route_normal(body, jwt_token).await;
+        if !router.authenticates(&jwt_token).await {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(make_error(&j["id"], "Invalid or expired JWT"))
+                .unwrap();
+        }
+        let (resp, status) = router.do_route_normal(body).await;
 
         Response::builder()
             .status(status)
@@ -1563,12 +1290,12 @@ async fn main() {
         .arg(
             clap::Arg::with_name("holesky")
                 .long("holesky")
-                .help("Enables configuration for the holesky testnet")
+                .help("Label this instance as Holesky (fork rules are enforced by the clients)")
         )
         .arg(
             clap::Arg::with_name("sepolia")
                 .long("sepolia")
-                .help("Enables configuration for the sepolia testnet")
+                .help("Label this instance as Sepolia (fork rules are enforced by the clients)")
         )
         .get_matches();
 
@@ -1630,7 +1357,7 @@ async fn main() {
         }
     };
 
-    let mut general_jwt: Option<jsonwebtoken::EncodingKey> = None;
+    let mut general_jwt: Option<JwtKey> = None;
     if let Some(general_jwt_path) = jwt_secret_path {
         general_jwt = Some(match read_jwt(general_jwt_path) {
             Ok(general_jwt) => general_jwt,
@@ -1709,19 +1436,17 @@ async fn main() {
         )));
     }
 
-    // We already rejected holesky && sepolia configs
-    let fork_config = match (is_holesky, is_sepolia) {
+    // Retain the network flags for CLI compatibility. Protocol versions are
+    // selected by the CL, so EB no longer maintains a separate fork schedule.
+    match (is_holesky, is_sepolia) {
         (true, false) => {
             tracing::info!("Running on holesky testnet");
-            ForkConfig::holesky()
         }
         (false, true) => {
             tracing::info!("Running on sepolia testnet");
-            ForkConfig::sepolia()
         }
         (false, false) => {
             tracing::info!("Running on mainnet");
-            ForkConfig::mainnet()
         }
         (true, true) => {
             tracing::error!(
@@ -1735,12 +1460,10 @@ async fn main() {
     let primary_node = nodesinstances.first().unwrap().clone();
 
     let router = Arc::new(NodeRouter::new(
-        //jwt_secret,
         fcu_majority,
         nodesinstances,
         primary_node,
         node_timings_enabled,
-        fork_config,
         general_jwt,
         general_timeout,
     ));
@@ -1775,4 +1498,722 @@ async fn main() {
     };
     tracing::info!("Listening on {}", addr);
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod glamsterdam_tests {
+    use super::*;
+    use serde_json::Value;
+
+    const AMSTERDAM_HASH: &str =
+        "0xc492baef5336bc976cd5533bfb5933f975b3eda8d88653ceafcffeb4e709c4af";
+    const PRAGUE_HASH: &str = "0xc53c05f024ebb8635c8ce11c86701fcedeb983f0e2b86da16878a920b4547f59";
+
+    fn hash() -> String {
+        format!("0x{}", "00".repeat(32))
+    }
+
+    // Synthetic hash vectors independently calculated with Python RLP and
+    // PyCryptodome Keccak, using the EIP-7685/7928/7843 header field order.
+    fn payload(amsterdam: bool) -> Value {
+        let mut payload = json!({
+            "parentHash": hash(), "feeRecipient": format!("0x{}", "00".repeat(20)),
+            "stateRoot": hash(), "receiptsRoot": hash(),
+            "logsBloom": format!("0x{}", "00".repeat(256)), "prevRandao": hash(),
+            "blockNumber": "0x1", "gasLimit": "0xbebc200", "gasUsed": "0x0",
+            "timestamp": "0x6ac4fd60", "extraData": "0x", "baseFeePerGas": "0x1",
+            "blockHash": PRAGUE_HASH, "transactions": [], "withdrawals": [],
+            "blobGasUsed": "0x0", "excessBlobGas": "0x0"
+        });
+        if amsterdam {
+            payload["blockHash"] = json!(AMSTERDAM_HASH);
+            payload["blockAccessList"] =
+                json!("0xdcdb941111111111111111111111111111111111111111c0c101c0c0c0");
+            payload["slotNumber"] = json!("0xac6000");
+        }
+        payload
+    }
+
+    fn request(method: &str, params: Value) -> RpcRequest {
+        serde_json::from_value(
+            json!({"jsonrpc":"2.0", "id":"cl-request", "method":method, "params":params}),
+        )
+        .unwrap()
+    }
+
+    fn legacy_payload(version: u8) -> Value {
+        let mut payload = payload(false);
+        if version < 3 {
+            payload.as_object_mut().unwrap().remove("blobGasUsed");
+            payload.as_object_mut().unwrap().remove("excessBlobGas");
+        }
+        if version == 1 {
+            payload.as_object_mut().unwrap().remove("withdrawals");
+        }
+        payload
+    }
+
+    fn new_payload(amsterdam: bool) -> RpcRequest {
+        request(
+            if amsterdam {
+                "engine_newPayloadV5"
+            } else {
+                "engine_newPayloadV4"
+            },
+            json!([payload(amsterdam), [], hash(), ["0x0001", "0x030203"]]),
+        )
+    }
+
+    fn fcu(version: u8, attributes: bool) -> RpcRequest {
+        let attributes = if attributes {
+            let mut attributes = json!({"timestamp":"0x6ac4fd60", "prevRandao":hash(),
+                "suggestedFeeRecipient":format!("0x{}", "11".repeat(20))});
+            if version >= 2 {
+                attributes["withdrawals"] = json!([]);
+            }
+            if version >= 3 {
+                attributes["parentBeaconBlockRoot"] = json!(hash());
+            }
+            if version == 4 {
+                attributes["slotNumber"] = json!("0xac6000");
+                attributes["targetGasLimit"] = json!("0xbebc200");
+            }
+            attributes
+        } else {
+            Value::Null
+        };
+        let mut params = json!([{"headBlockHash":hash(), "safeBlockHash":hash(), "finalizedBlockHash":hash()}, attributes]);
+        if version == 4 {
+            params
+                .as_array_mut()
+                .unwrap()
+                .push(json!("0x01000000000000000000000000000000"));
+        }
+        request(&format!("engine_forkchoiceUpdatedV{}", version), params)
+    }
+
+    fn status(status: &str) -> Value {
+        json!({"status":status, "latestValidHash":if status == "VALID" { json!(hash()) } else { Value::Null }, "validationError":null})
+    }
+
+    fn fcu_result(status_name: &str, id: Value) -> Value {
+        json!({"payloadStatus":status(status_name), "payloadId":id})
+    }
+
+    fn envelope(amsterdam: bool, value: &str) -> Value {
+        json!({"executionPayload":payload(amsterdam), "blockValue":value,
+            "blobsBundle":{"commitments":[], "proofs":[], "blobs":[]},
+            "shouldOverrideBuilder":true, "executionRequests":["0x0001", "0x030203"],
+            "clientExtension":{"preserve":true}})
+    }
+
+    struct MockEl {
+        node: Arc<Node>,
+        replies: Arc<Mutex<HashMap<String, Value>>>,
+        seen: Arc<Mutex<Vec<Value>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for MockEl {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl MockEl {
+        async fn new() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let secret = format!("{:032}", address.port());
+            let replies = Arc::new(Mutex::new(HashMap::<String, Value>::new()));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let node = Arc::new(Node::new(
+                format!("http://{}", address),
+                JwtKey::from_secret(secret.as_bytes()),
+                Duration::from_millis(500),
+                false,
+            ));
+            node.set_synced().await;
+            let handler_replies = replies.clone();
+            let handler_seen = seen.clone();
+            let app = Router::new().route("/", axum::routing::post(move |headers: HeaderMap, extract::Json(body): extract::Json<Value>| {
+                let replies = handler_replies.clone();
+                let seen = handler_seen.clone();
+                let secret = secret.clone();
+                async move {
+                    let bearer = headers.get("Authorization").unwrap().to_str().unwrap().strip_prefix("Bearer ").unwrap();
+                    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+                    validation.required_spec_claims.clear();
+                    validation.validate_exp = false;
+                    // The inbound token deliberately differs from every backend secret.
+                    assert!(jsonwebtoken::decode::<Claims>(bearer,
+                        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()), &validation).is_ok());
+                    seen.lock().await.push(body.clone());
+                    let mut reply = replies.lock().await.get(body["method"].as_str().unwrap()).cloned()
+                        .unwrap_or_else(|| json!({"error":{"code":-32601,"message":"Method not found"}}));
+                    reply["jsonrpc"] = json!("2.0");
+                    reply["id"] = body["id"].clone();
+                    ([(header::CONNECTION, "close")], extract::Json(reply))
+                }
+            }));
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self {
+                node,
+                replies,
+                seen,
+                task,
+            }
+        }
+
+        async fn result(&self, method: &str, result: Value) {
+            self.replies
+                .lock()
+                .await
+                .insert(method.into(), json!({"result":result}));
+        }
+
+        async fn stop(&self) {
+            self.task.abort();
+            while !self.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        async fn error(&self, method: &str, code: i32) {
+            self.replies.lock().await.insert(
+                method.into(),
+                json!({"error":{"code":code,"message":"EL error","data":"preserve"}}),
+            );
+        }
+    }
+
+    async fn router(els: &[&MockEl]) -> NodeRouter {
+        let nodes: Vec<_> = els.iter().map(|el| el.node.clone()).collect();
+        let router = NodeRouter::new(0.6, nodes.clone(), nodes[0].clone(), false, None, None);
+        *router.alive_nodes.write().await = nodes;
+        router
+    }
+
+    async fn call(router: &NodeRouter, request: &RpcRequest) -> Value {
+        let (body, code) = router.do_engine_route(request).await;
+        assert_eq!(code, 200);
+        let response: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["id"], request.id);
+        assert_eq!(response["jsonrpc"], "2.0");
+        response
+    }
+
+    #[test]
+    fn header_hashes_include_requests_bal_and_slot() {
+        for amsterdam in [false, true] {
+            let req = new_payload(amsterdam);
+            let parsed = parse_new_payload(&req).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&make_syncing_str(&req, Some(&parsed))).unwrap()
+                    ["result"]["status"],
+                "SYNCING"
+            );
+            for field in if amsterdam {
+                vec!["slotNumber", "blockAccessList"]
+            } else {
+                vec!["gasLimit"]
+            } {
+                let mut changed = req.clone();
+                changed.params[0][field] = json!(if field == "blockAccessList" {
+                    "0xc0"
+                } else {
+                    "0x2"
+                });
+                let parsed = parse_new_payload(&changed).unwrap();
+                let response: Value =
+                    serde_json::from_str(&make_syncing_str(&changed, Some(&parsed))).unwrap();
+                assert_eq!(response["result"]["status"], "INVALID");
+                assert!(response["result"]["latestValidHash"].is_null());
+            }
+            let mut changed = req.clone();
+            changed.params[3] = json!([]);
+            let parsed = parse_new_payload(&changed).unwrap();
+            let response: Value =
+                serde_json::from_str(&make_syncing_str(&changed, Some(&parsed))).unwrap();
+            assert_eq!(response["result"]["status"], "INVALID");
+        }
+    }
+
+    #[test]
+    fn tied_votes_have_no_majority() {
+        let node = Arc::new(Node::new(
+            "http://127.0.0.1".into(),
+            JwtKey::from_secret(&[1; 32]),
+            Duration::from_secs(1),
+            false,
+        ));
+        let router = NodeRouter::new(0.6, vec![node.clone()], node, false, None, None);
+        for other in ["INVALID", "SYNCING", "ACCEPTED"] {
+            let valid: PayloadStatusV1 = serde_json::from_value(status("VALID")).unwrap();
+            let other: PayloadStatusV1 = serde_json::from_value(status(other)).unwrap();
+            assert!(router
+                .fcu_majority(&mut [valid.clone(), other.clone()])
+                .is_none());
+            assert!(router.fcu_majority(&mut [other, valid]).is_none());
+        }
+        let invalid: PayloadStatusV1 = serde_json::from_value(status("INVALID")).unwrap();
+        assert_eq!(
+            router
+                .fcu_majority(&mut [invalid.clone(), invalid])
+                .unwrap()
+                .status,
+            PayloadStatusV1Status::Invalid
+        );
+    }
+
+    #[test]
+    fn legacy_hash_failures_use_versioned_status_codes() {
+        for (version, expected) in [(1, "INVALID_BLOCK_HASH"), (2, "INVALID")] {
+            let req = request(
+                &format!("engine_newPayloadV{}", version),
+                json!([legacy_payload(version)]),
+            );
+            let parsed = parse_new_payload(&req).unwrap();
+            let response: Value =
+                serde_json::from_str(&make_syncing_str(&req, Some(&parsed))).unwrap();
+            assert_eq!(response["result"]["status"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn v6_selects_complete_payload_retries_and_survives_backend_failure() {
+        let a = MockEl::new().await;
+        let b = MockEl::new().await;
+        let c = MockEl::new().await;
+        a.result(
+            "engine_forkchoiceUpdatedV4",
+            fcu_result("VALID", json!("0x0101010101010101")),
+        )
+        .await;
+        b.result(
+            "engine_forkchoiceUpdatedV4",
+            fcu_result("VALID", json!("0x0202020202020202")),
+        )
+        .await;
+        c.result(
+            "engine_forkchoiceUpdatedV4",
+            fcu_result("SYNCING", Value::Null),
+        )
+        .await;
+        a.result("engine_getPayloadV6", envelope(true, "0x10"))
+            .await;
+        b.result("engine_getPayloadV6", envelope(true, "0x100"))
+            .await;
+        let router = router(&[&a, &b, &c]).await;
+        let fc = fcu(4, true);
+        let response = call(&router, &fc).await;
+        assert_eq!(response["result"]["payloadStatus"]["status"], "VALID");
+        let id = response["result"]["payloadId"].clone();
+        assert!(id.as_str().is_some());
+        for el in [&a, &b, &c] {
+            assert_eq!(el.seen.lock().await[0], serde_json::to_value(&fc).unwrap());
+        }
+        let get = request("engine_getPayloadV6", json!([id]));
+        for _ in 0..2 {
+            assert_eq!(call(&router, &get).await["result"], envelope(true, "0x100"));
+        }
+        assert_eq!(
+            a.seen.lock().await[1]["params"],
+            json!(["0x0101010101010101"])
+        );
+        assert_eq!(
+            b.seen.lock().await[1]["params"],
+            json!(["0x0202020202020202"])
+        );
+        assert_eq!(c.seen.lock().await.len(), 1);
+        let mut malformed = envelope(true, "0x1000");
+        malformed["executionPayload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("blockAccessList");
+        b.result("engine_getPayloadV6", malformed).await;
+        assert_eq!(call(&router, &get).await["result"], envelope(true, "0x10"));
+        b.error("engine_getPayloadV6", -38001).await;
+        assert_eq!(call(&router, &get).await["result"], envelope(true, "0x10"));
+        a.error("engine_getPayloadV6", -38005).await;
+        assert!(call(&router, &get).await.get("error").is_some());
+        // Failed fetches must not consume the build ID.
+        a.result("engine_getPayloadV6", envelope(true, "0x20"))
+            .await;
+        assert_eq!(call(&router, &get).await["result"], envelope(true, "0x20"));
+        b.stop().await;
+        assert_eq!(call(&router, &get).await["result"], envelope(true, "0x20"));
+    }
+
+    #[tokio::test]
+    async fn legacy_payload_versions_remain_fetchable() {
+        let el = MockEl::new().await;
+        let router = router(&[&el]).await;
+        for (fc_version, get_method, result) in [
+            (3, "engine_getPayloadV5", envelope(false, "0x1")),
+            (1, "engine_getPayloadV1", legacy_payload(1)),
+            (
+                1,
+                "engine_getPayloadV2",
+                json!({"executionPayload":legacy_payload(1), "blockValue":"0x1"}),
+            ),
+            (
+                2,
+                "engine_getPayloadV2",
+                json!({"executionPayload":legacy_payload(2), "blockValue":"0x2"}),
+            ),
+        ] {
+            el.result(
+                &format!("engine_forkchoiceUpdatedV{}", fc_version),
+                fcu_result("VALID", json!("0x1111111111111111")),
+            )
+            .await;
+            el.result(get_method, result.clone()).await;
+            let build = call(&router, &fcu(fc_version, true)).await;
+            let get = request(get_method, json!([build["result"]["payloadId"]]));
+            assert_eq!(call(&router, &get).await["result"], result);
+        }
+    }
+
+    #[tokio::test]
+    async fn new_payload_fanout_and_disagreement_preserve_protocol() {
+        let a = MockEl::new().await;
+        let b = MockEl::new().await;
+        let c = MockEl::new().await;
+        let router = router(&[&a, &b, &c]).await;
+        let req = new_payload(true);
+        for el in [&a, &b, &c] {
+            el.result("engine_newPayloadV5", status("VALID")).await;
+        }
+        assert_eq!(call(&router, &req).await["result"]["status"], "VALID");
+        for el in [&a, &b, &c] {
+            assert_eq!(el.seen.lock().await[0], serde_json::to_value(&req).unwrap());
+        }
+        c.result("engine_newPayloadV5", status("INVALID")).await;
+        assert_eq!(call(&router, &req).await["result"]["status"], "SYNCING");
+        b.result("engine_newPayloadV5", status("INVALID")).await;
+        assert_eq!(call(&router, &req).await["result"]["status"], "INVALID");
+        router.alive_nodes.write().await.clear();
+        assert_eq!(call(&router, &req).await["result"]["status"], "SYNCING");
+    }
+
+    #[tokio::test]
+    async fn null_payload_ids_errors_and_custody_only_updates() {
+        let el = MockEl::new().await;
+        let router = router(&[&el]).await;
+        for state in ["VALID", "SYNCING", "INVALID"] {
+            el.result("engine_forkchoiceUpdatedV4", fcu_result(state, Value::Null))
+                .await;
+            let response = call(&router, &fcu(4, true)).await;
+            assert!(response["result"]["payloadId"].is_null());
+            assert_eq!(response["result"]["payloadStatus"]["status"], state);
+            assert!(router.payload_ids.lock().await.is_empty());
+        }
+        el.result(
+            "engine_forkchoiceUpdatedV4",
+            fcu_result("VALID", Value::Null),
+        )
+        .await;
+        let req = fcu(4, false);
+        call(&router, &req).await;
+        assert_eq!(
+            el.seen.lock().await.last().unwrap(),
+            &serde_json::to_value(&req).unwrap()
+        );
+        for (method, req) in [
+            ("engine_forkchoiceUpdatedV4", fcu(4, true)),
+            ("engine_newPayloadV5", new_payload(true)),
+        ] {
+            for code in [-38005, -32602, -38003] {
+                el.error(method, code).await;
+                let response = call(&router, &req).await;
+                assert_eq!(response["error"]["code"], code);
+                assert_eq!(response["error"]["data"], "preserve");
+            }
+        }
+        router.alive_nodes.write().await.clear();
+        let response = call(&router, &req).await;
+        assert_eq!(response["result"]["payloadStatus"]["status"], "SYNCING");
+        assert!(response["result"].get("payloadId").unwrap().is_null());
+        assert!(response.get("payloadId").is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_requests_return_rpc_errors_without_panics() {
+        let el = MockEl::new().await;
+        let router = router(&[&el]).await;
+        for method in [
+            "engine_getPayloadV6",
+            "engine_forkchoiceUpdatedV4",
+            "engine_newPayloadV5",
+        ] {
+            for params in [
+                Value::Null,
+                json!([]),
+                json!([null]),
+                json!({"payload":null}),
+            ] {
+                assert_eq!(
+                    call(&router, &request(method, params)).await["error"]["code"],
+                    -32602
+                );
+            }
+        }
+        for field in ["blockAccessList", "slotNumber"] {
+            let mut req = new_payload(true);
+            req.params[0].as_object_mut().unwrap().remove(field);
+            assert_eq!(call(&router, &req).await["error"]["code"], -32602);
+        }
+        for requests in [
+            json!(null),
+            json!(["0x00"]),
+            json!(["0x0301", "0x0001"]),
+            json!(["0x0001", "0x0002"]),
+        ] {
+            let mut req = new_payload(true);
+            req.params[3] = requests;
+            assert_eq!(call(&router, &req).await["error"]["code"], -32602);
+        }
+        let mut req = fcu(4, false);
+        req.params[2] = json!("0x01");
+        assert_eq!(call(&router, &req).await["error"]["code"], -32602);
+        assert_eq!(
+            call(
+                &router,
+                &request("engine_getPayloadV6", json!(["0xffffffffffffffff"]))
+            )
+            .await["error"]["code"],
+            -38001
+        );
+        assert!(el.seen.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capabilities_filter_unknown_methods_and_intersect_backends() {
+        let a = MockEl::new().await;
+        let b = MockEl::new().await;
+        a.result(
+            "engine_exchangeCapabilities",
+            json!([
+                "engine_newPayloadV5",
+                "engine_getPayloadV6",
+                "engine_getBlobsV99"
+            ]),
+        )
+        .await;
+        b.result(
+            "engine_exchangeCapabilities",
+            json!(["engine_newPayloadV5", "engine_getBlobsV99"]),
+        )
+        .await;
+        let router = router(&[&a, &b]).await;
+        let req = request("engine_exchangeCapabilities", json!([[]]));
+        assert_eq!(
+            call(&router, &req).await["result"],
+            json!(["engine_newPayloadV5"])
+        );
+        b.error("engine_exchangeCapabilities", -32601).await;
+        assert_eq!(call(&router, &req).await["result"], json!([]));
+        b.stop().await;
+        assert_eq!(
+            call(&router, &req).await["result"],
+            json!(["engine_getPayloadV6", "engine_newPayloadV5"])
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_rpc_envelopes_keep_protocol_error_codes() {
+        let node = Arc::new(Node::new(
+            "http://127.0.0.1".into(),
+            JwtKey::from_secret(&[1; 32]),
+            Duration::from_secs(1),
+            false,
+        ));
+        let router = Arc::new(NodeRouter::new(
+            0.6,
+            vec![node.clone()],
+            node,
+            false,
+            None,
+            None,
+        ));
+        for (body, code, id) in [
+            ("{".to_owned(), -32700, Value::Null),
+            (
+                json!({"jsonrpc":"2.0","id":"missing-method"}).to_string(),
+                -32600,
+                json!("missing-method"),
+            ),
+            (
+                json!({"jsonrpc":"2.0","id":"unsupported","method":"engine_unknown","params":[]})
+                    .to_string(),
+                -32601,
+                json!("unsupported"),
+            ),
+        ] {
+            let response = route_all(HeaderMap::new(), Extension(router.clone()), body)
+                .await
+                .into_response();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let response: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["error"]["code"], code);
+            assert_eq!(response["id"], id);
+        }
+    }
+
+    #[tokio::test]
+    async fn cl_authentication_precedes_backend_token_substitution() {
+        let el = MockEl::new().await;
+        el.result("engine_newPayloadV5", status("VALID")).await;
+        let mut router = router(&[&el]).await;
+        let cl_key = JwtKey::from_secret(&[42; 32]);
+        router.general_jwt = Some(cl_key.clone());
+        let router = Arc::new(router);
+        let request = new_payload(true);
+        for token in ["not-a-token".into(), make_jwt(&el.node.jwt_key).unwrap()] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "Authorization",
+                format!("Bearer {}", token).parse().unwrap(),
+            );
+            let response = route_all(
+                headers,
+                Extension(router.clone()),
+                serde_json::to_string(&request).unwrap(),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(el.seen.lock().await.is_empty());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", make_jwt(&cl_key).unwrap())
+                .parse()
+                .unwrap(),
+        );
+        let response = route_all(
+            headers,
+            Extension(router),
+            serde_json::to_string(&request).unwrap(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["result"]["status"], "VALID");
+        assert_eq!(el.seen.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn payload_cache_is_bounded_and_expired_ids_are_unknown() {
+        let el = MockEl::new().await;
+        el.result(
+            "engine_forkchoiceUpdatedV4",
+            fcu_result("VALID", json!("0x1111111111111111")),
+        )
+        .await;
+        let router = router(&[&el]).await;
+        for i in 0..MAX_PAYLOAD_BUILDS {
+            router.payload_ids.lock().await.insert(
+                format!("0x{:016x}", i),
+                PayloadBuild {
+                    created: std::time::Instant::now(),
+                    nodes: vec![],
+                },
+            );
+        }
+        let response = call(&router, &fcu(4, true)).await;
+        let id = response["result"]["payloadId"].as_str().unwrap();
+        assert_eq!(router.payload_ids.lock().await.len(), MAX_PAYLOAD_BUILDS);
+        router.payload_ids.lock().await.get_mut(id).unwrap().created =
+            std::time::Instant::now() - PAYLOAD_CACHE_TTL;
+        assert_eq!(
+            call(&router, &request("engine_getPayloadV6", json!([id]))).await["error"]["code"],
+            -38001
+        );
+    }
+
+    #[tokio::test]
+    async fn syncing_backends_receive_custody_updates() {
+        let a = MockEl::new().await;
+        let b = MockEl::new().await;
+        a.result(
+            "engine_forkchoiceUpdatedV4",
+            fcu_result("VALID", Value::Null),
+        )
+        .await;
+        b.result(
+            "engine_forkchoiceUpdatedV4",
+            fcu_result("SYNCING", Value::Null),
+        )
+        .await;
+        let router = router(&[&a, &b]).await;
+        router
+            .alive_nodes
+            .write()
+            .await
+            .retain(|node| node.url != b.node.url);
+        router
+            .alive_but_syncing_nodes
+            .write()
+            .await
+            .push(b.node.clone());
+        b.node.set_online_and_syncing().await;
+        let req = fcu(4, false);
+        assert_eq!(
+            call(&router, &req).await["result"]["payloadStatus"]["status"],
+            "VALID"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !b.seen.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(b.seen.lock().await[0], serde_json::to_value(&req).unwrap());
+    }
+
+    #[tokio::test]
+    async fn bodies_and_sparse_cells_are_forwarded_intact() {
+        let el = MockEl::new().await;
+        let router = router(&[&el]).await;
+        for (method, params, result) in [
+            (
+                "engine_getBlobsV4",
+                json!([[hash(), hash()], "0x03000000000000000000000000000000"]),
+                json!([{"blob_cells":["0x1234",null],"proofs":["0x5678",null]},null]),
+            ),
+            (
+                "engine_getPayloadBodiesByHashV2",
+                json!([[hash(), hash()]]),
+                json!([null,{"transactions":[],"withdrawals":[],"blockAccessList":"0xc0"}]),
+            ),
+            (
+                "engine_getPayloadBodiesByRangeV2",
+                json!(["0x1", "0x1"]),
+                json!([{"transactions":[],"withdrawals":null,"blockAccessList":null}]),
+            ),
+        ] {
+            el.result(method, result.clone()).await;
+            let req = request(method, params);
+            assert_eq!(call(&router, &req).await["result"], result);
+            assert_eq!(
+                el.seen.lock().await.last().unwrap(),
+                &serde_json::to_value(&req).unwrap()
+            );
+        }
+    }
 }

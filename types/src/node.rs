@@ -1,5 +1,4 @@
 use crate::*;
-use jsonwebtoken;
 use reqwest;
 use serde_json::json;
 use std::sync::Arc;
@@ -19,18 +18,30 @@ pub struct Node
     pub client: reqwest::Client,
     pub url: String,
     pub status: Arc<RwLock<NodeHealth>>,
-    pub jwt_key: jsonwebtoken::EncodingKey,
+    pub jwt_key: JwtKey,
     pub timeout: Duration,
     pub do_not_use: bool,
 }
 
 impl Node {
-    pub fn new(
-        url: String,
-        jwt_key: jsonwebtoken::EncodingKey,
-        timeout: Duration,
-        do_not_use: bool,
-    ) -> Node {
+    fn authenticated_request(&self) -> reqwest::RequestBuilder {
+        self.client
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .bearer_auth(make_jwt(&self.jwt_key).expect("HS256 signing failed"))
+    }
+
+    fn request_timeout(&self, method: &EngineMethod) -> Duration {
+        // Amsterdam lowers newPayload's CL deadline to 6s. Leave time for
+        // aggregation and the response, even if --timeout is larger.
+        if *method == EngineMethod::engine_newPayloadV5 {
+            self.timeout.min(Duration::from_millis(5500))
+        } else {
+            self.timeout
+        }
+    }
+
+    pub fn new(url: String, jwt_key: JwtKey, timeout: Duration, do_not_use: bool) -> Node {
         let client = reqwest::Client::new();
         Node {
             client,
@@ -91,14 +102,9 @@ impl Node {
     }
 
     pub async fn check_status(&self) -> Result<NodeHealth, reqwest::Error> {
-        // we need to use jwt here since we're talking directly to the EE's auth port
-        let token = make_jwt(&self.jwt_key).unwrap();
         let start = std::time::Instant::now();
         let resp = self
-            .client
-            .post(self.url.clone())
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
+            .authenticated_request()
             .json(&json!({"jsonrpc": "2.0", "method": "eth_syncing", "params": [], "id": 1}))
             .timeout(self.timeout)
             .send()
@@ -136,18 +142,11 @@ impl Node {
         Ok(status.clone())
     }
 
-    pub async fn do_request(
-        &self,
-        data: &RpcRequest,
-        jwt_token: String,
-    ) -> Result<String, reqwest::Error> {
+    pub async fn do_request(&self, data: &RpcRequest) -> Result<String, reqwest::Error> {
         let resp = self
-            .client
-            .post(&self.url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", jwt_token)
+            .authenticated_request()
             .body(data.as_bytes())
-            .timeout(self.timeout)
+            .timeout(self.request_timeout(&data.method))
             .send()
             .await;
 
@@ -166,14 +165,10 @@ impl Node {
     pub async fn do_request_timeout(
         &self,
         data: &RpcRequest,
-        jwt_token: String,
         timeout: Duration,
     ) -> Result<String, reqwest::Error> {
         let resp = self
-            .client
-            .post(&self.url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", jwt_token)
+            .authenticated_request()
             .body(data.as_bytes())
             .timeout(timeout)
             .send()
@@ -191,16 +186,9 @@ impl Node {
         Ok(resp_body)
     }
 
-    pub async fn do_request_no_timeout(
-        &self,
-        data: &RpcRequest,
-        jwt_token: String,
-    ) -> Result<String, reqwest::Error> {
+    pub async fn do_request_no_timeout(&self, data: &RpcRequest) -> Result<String, reqwest::Error> {
         let resp = self
-            .client
-            .post(&self.url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", jwt_token)
+            .authenticated_request()
             .body(data.as_bytes())
             .send()
             .await;
@@ -217,19 +205,8 @@ impl Node {
         Ok(resp_body)
     }
 
-    pub async fn do_request_no_timeout_str(
-        &self,
-        data: String,
-        jwt_token: String,
-    ) -> Result<String, reqwest::Error> {
-        let resp = self
-            .client
-            .post(&self.url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", jwt_token)
-            .body(data)
-            .send()
-            .await;
+    pub async fn do_request_no_timeout_str(&self, data: String) -> Result<String, reqwest::Error> {
+        let resp = self.authenticated_request().body(data).send().await;
 
         let resp = match resp {
             Ok(resp) => resp,
@@ -241,5 +218,33 @@ impl Node {
 
         let resp_body = resp.text().await?;
         Ok(resp_body)
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn amsterdam_deadline_caps_only_longer_timeouts() {
+        let mut node = Node::new(
+            "http://127.0.0.1".into(),
+            JwtKey::from_secret(&[1; 32]),
+            Duration::from_secs(8),
+            false,
+        );
+        assert_eq!(
+            node.request_timeout(&EngineMethod::engine_newPayloadV5),
+            Duration::from_millis(5500)
+        );
+        assert_eq!(
+            node.request_timeout(&EngineMethod::engine_newPayloadV4),
+            Duration::from_secs(8)
+        );
+        node.timeout = Duration::from_millis(500);
+        assert_eq!(
+            node.request_timeout(&EngineMethod::engine_newPayloadV5),
+            node.timeout
+        );
     }
 }

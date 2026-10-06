@@ -20,6 +20,7 @@ Thank you Lighthouse Team for everything you do!
 use ethereum_types::{Address, H256, H64, U256};
 use keccak_hash::KECCAK_EMPTY_LIST_RLP;
 use rlp::RlpStream;
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use triehash::ordered_trie_root;
 use types::keccak::{keccak256, KeccakHasher};
@@ -45,6 +46,15 @@ pub fn rlp_encode_block_header(header: &ExecutionBlockHeader) -> Vec<u8> {
     if let Some(parent_beacon_block_root) = &header.parent_beacon_block_root {
         rlp_header_stream.append(parent_beacon_block_root);
     }
+    if let Some(requests_hash) = &header.requests_hash {
+        rlp_header_stream.append(requests_hash);
+    }
+    if let Some(block_access_list_hash) = &header.block_access_list_hash {
+        rlp_header_stream.append(block_access_list_hash);
+    }
+    if let Some(slot_number) = &header.slot_number {
+        rlp_header_stream.append(slot_number);
+    }
     rlp_header_stream.finalize_unbounded_list();
     rlp_header_stream.out().into()
 }
@@ -64,6 +74,7 @@ pub fn rlp_encode_withdrawal(withdrawal: &Withdrawal) -> Vec<u8> {
 pub fn verify_payload_block_hash(
     payload: &ExecutionPayload,
     parent_beacon_block_root: Option<H256>,
+    execution_requests: Option<&[String]>,
 ) -> Result<(), Box<dyn Error>> {
     // Calculate the transactions root.
     // We're currently using a deprecated Parity library for this. We should move to a
@@ -87,7 +98,7 @@ pub fn verify_payload_block_hash(
     let rlp_excess_blob_gas = payload.excess_blob_gas().ok();
 
     // Construct the block header.
-    let exec_block_header = ExecutionBlockHeader::from_payload(
+    let mut exec_block_header = ExecutionBlockHeader::from_payload(
         payload,
         KECCAK_EMPTY_LIST_RLP.as_fixed_bytes().into(),
         rlp_transactions_root,
@@ -96,6 +107,17 @@ pub fn verify_payload_block_hash(
         rlp_excess_blob_gas,
         parent_beacon_block_root,
     );
+    if let Some(requests) = execution_requests {
+        // EIP-7685: SHA256(concat(SHA256(request_type || request_data))).
+        let mut hasher = Sha256::new();
+        for request in requests {
+            let bytes = hex::decode(request.strip_prefix("0x").ok_or("Invalid request DATA")?)?;
+            if bytes.len() > 1 {
+                hasher.update(Sha256::digest(&bytes));
+            }
+        }
+        exec_block_header.requests_hash = Some(H256(hasher.finalize().into()));
+    }
 
     // Hash the RLP encoding of the block header.
     let rlp_block_header = rlp_encode_block_header(&exec_block_header);
@@ -133,7 +155,7 @@ mod tests {
         println!("{:?}", json["params"][0]["withdrawals"]);
 
         // verify the payload block hash.
-        verify_payload_block_hash(&payload, None)?;
+        verify_payload_block_hash(&payload, None, None)?;
 
         // change payloads params.0.blockHash to some random hash and verify (it should fail)
         json["params"][0]["blockHash"] = serde_json::Value::String(
@@ -141,7 +163,7 @@ mod tests {
         ); // hash from above but slightly changed
         let payload: ExecutionPayload =
             ExecutionPayload::V2(serde_json::from_value(json["params"][0].clone())?);
-        let res = verify_payload_block_hash(&payload, None);
+        let res = verify_payload_block_hash(&payload, None, None);
         assert!(res.is_err());
 
         Ok(())

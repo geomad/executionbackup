@@ -196,3 +196,18 @@ struct RecheckMetricsReport {
 cargo test --all
 ```
 
+## Glamsterdam (Amsterdam / Gloas)
+
+This version implements the [Amsterdam Engine API](https://github.com/ethereum/execution-apis/blob/main/src/engine/amsterdam.md), including:
+
+- `engine_newPayloadV5` and `engine_getPayloadV6`, with block access lists and slot numbers.
+- `engine_forkchoiceUpdatedV4`, preserving `targetGasLimit`, `slotNumber`, and the third `custodyColumns` parameter, including updates with null payload attributes.
+- `engine_getPayloadBodiesByHashV2`, `engine_getPayloadBodiesByRangeV2`, and `engine_getBlobsV4`, preserving partial results and null entries.
+
+Earlier Engine API versions remain supported. The CL selects the API version, and the EL enforces the network's fork rules.
+
+EB returns the complete payload response with the highest block value. Payload IDs support repeated fetches for up to 120 seconds, with at most 1024 cached builds; an EL may expire its own build sooner. Responses with null payload IDs are excluded from retrieval.
+
+Capability negotiation advertises methods supported by EB and all responding voting ELs. Unreachable ELs are skipped; invalid capability responses contribute an empty set. `#do-not-use` nodes do not contribute capabilities or votes. The `engine_newPayloadV5` timeout is capped at 5.5 seconds; a smaller configured timeout still applies.
+
+EB authenticates CL requests against the global JWT secret and signs outgoing requests using each backend's secret. Without a global secret, the CL must use one of the configured backend secrets. Tokens must use HS256 and an `iat` within 60 seconds of EB's clock.
