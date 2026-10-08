@@ -11,6 +11,7 @@ pub struct NodeHealth {
     pub resp_time: u128,
     rpc_syncing: bool,
     forkchoice_generation: u64,
+    failed_forkchoice_generation: u64,
     forkchoice_ready: Option<bool>,
     observation_version: u64,
     probe_generation: u64,
@@ -56,6 +57,7 @@ impl Node {
                 resp_time: 0,
                 rpc_syncing: true,
                 forkchoice_generation: 0,
+                failed_forkchoice_generation: 0,
                 forkchoice_ready: None,
                 observation_version: 0,
                 probe_generation: 0,
@@ -89,7 +91,12 @@ impl Node {
 
     pub async fn set_offline(&self) {
         let mut health = self.status.write().await;
+        Self::mark_offline(&mut health);
+    }
+
+    fn mark_offline(health: &mut NodeHealth) {
         health.status = SyncingStatus::Offline;
+        health.failed_forkchoice_generation = health.forkchoice_generation;
         // A disconnected/restarted EL must establish readiness again.
         if health.forkchoice_ready.is_some() {
             health.forkchoice_ready = Some(false);
@@ -116,7 +123,9 @@ impl Node {
             _ => return,
         };
         let mut health = self.status.write().await;
-        if generation != health.forkchoice_generation {
+        if generation != health.forkchoice_generation
+            || generation <= health.failed_forkchoice_generation
+        {
             return;
         }
         health.forkchoice_ready = Some(ready);
@@ -153,6 +162,7 @@ impl Node {
                         && (body["result"].is_boolean() || body["result"].is_object()) =>
                 {
                     health.rpc_syncing = body["result"] != false;
+                    health.observation_version += 1;
                     self.update_readiness(&mut health);
                 }
                 _ => {
@@ -167,24 +177,37 @@ impl Node {
         response.map(|_| health.clone())
     }
 
-    pub async fn do_request(&self, data: &RpcRequest) -> Result<String, reqwest::Error> {
-        let resp = self
-            .authenticated_request()
-            .body(data.as_bytes())
-            .timeout(self.request_timeout(&data.method))
-            .send()
-            .await;
-
-        let resp = match resp {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::error!("Error while sending request to node {}: {}", self.url, e);
-                return Err(e);
+    async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<String, reqwest::Error> {
+        let version = self.status.read().await.observation_version;
+        let result = async { request.send().await?.text().await }.await;
+        if let Err(error) = &result {
+            if error.is_connect() {
+                let mut health = self.status.write().await;
+                // Ignore a delayed connection failure if newer health/Engine
+                // evidence has arrived, and invalidate older probes/replies.
+                if health.observation_version == version {
+                    Self::mark_offline(&mut health);
+                }
             }
-        };
+            tracing::error!(
+                "Error while sending request to node {}: {}",
+                self.url,
+                error
+            );
+        }
+        result
+    }
 
-        let resp_body = resp.text().await?;
-        Ok(resp_body)
+    pub async fn do_request(&self, data: &RpcRequest) -> Result<String, reqwest::Error> {
+        self.send_request(
+            self.authenticated_request()
+                .body(data.as_bytes())
+                .timeout(self.request_timeout(&data.method)),
+        )
+        .await
     }
 
     pub async fn do_request_timeout(
@@ -192,57 +215,17 @@ impl Node {
         data: &RpcRequest,
         timeout: Duration,
     ) -> Result<String, reqwest::Error> {
-        let resp = self
-            .authenticated_request()
-            .body(data.as_bytes())
-            .timeout(timeout)
-            .send()
-            .await;
-
-        let resp = match resp {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::error!("Error while sending request to node {}: {}", self.url, e);
-                return Err(e);
-            }
-        };
-
-        let resp_body = resp.text().await?;
-        Ok(resp_body)
-    }
-
-    pub async fn do_request_no_timeout(&self, data: &RpcRequest) -> Result<String, reqwest::Error> {
-        let resp = self
-            .authenticated_request()
-            .body(data.as_bytes())
-            .send()
-            .await;
-
-        let resp = match resp {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::error!("Error while sending request to node {}: {}", self.url, e);
-                return Err(e);
-            }
-        };
-
-        let resp_body = resp.text().await?;
-        Ok(resp_body)
+        self.send_request(
+            self.authenticated_request()
+                .body(data.as_bytes())
+                .timeout(timeout),
+        )
+        .await
     }
 
     pub async fn do_request_no_timeout_str(&self, data: String) -> Result<String, reqwest::Error> {
-        let resp = self.authenticated_request().body(data).send().await;
-
-        let resp = match resp {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::error!("Error while sending request to node {}: {}", self.url, e);
-                return Err(e);
-            }
-        };
-
-        let resp_body = resp.text().await?;
-        Ok(resp_body)
+        self.send_request(self.authenticated_request().body(data))
+            .await
     }
 }
 

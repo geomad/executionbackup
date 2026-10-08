@@ -247,10 +247,11 @@ impl NodeRouter {
             nodes.append(&mut syncing_nodes);
         }
 
-        Self::requests_to_nodes(request, nodes).await
+        self.requests_to_nodes(request, nodes).await
     }
 
     async fn requests_to_nodes<T>(
+        &self,
         request: &RpcRequest,
         nodes: Vec<Arc<Node>>,
     ) -> (Vec<(Arc<Node>, T)>, Option<serde_json::Value>)
@@ -263,6 +264,13 @@ impl NodeRouter {
             futs.push(async {
                 let start = std::time::Instant::now();
                 let response = node.do_request(request).await;
+                if response
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.is_connect())
+                {
+                    self.refresh_routes().await;
+                }
                 let resp_time = start.elapsed().as_millis();
                 (response, node.clone(), resp_time)
             })
@@ -417,15 +425,24 @@ impl NodeRouter {
     // online syncing EL. Inspect live health so a classification being published
     // cannot make the only reachable EL disappear between cached lists.
     async fn get_execution_node(&self) -> Option<Arc<Node>> {
+        self.get_execution_node_excluding(&[]).await
+    }
+
+    async fn get_execution_node_excluding(&self, excluded: &[String]) -> Option<Arc<Node>> {
         let _update = self.routing_update.lock().await;
         let primary = self.primary_node.read().await.clone();
-        if primary.status.read().await.status == SyncingStatus::Synced {
+        if !excluded.contains(&primary.url)
+            && primary.status.read().await.status == SyncingStatus::Synced
+        {
             return Some(primary);
         }
         let nodes = self.nodes.lock().await.clone();
         let mut ready = Vec::new();
         let mut syncing = None;
         for node in nodes {
+            if excluded.contains(&node.url) {
+                continue;
+            }
             let health = node.status.read().await.clone();
             match health.status {
                 SyncingStatus::Synced => ready.push((health.resp_time, node)),
@@ -553,7 +570,7 @@ impl NodeRouter {
         });
         // Also await syncing voters, with the configured timeout: otherwise a
         // node demoted by SYNCING could have a later INVALID silently discarded.
-        let (mut responses, error) = Self::requests_to_nodes::<T>(request, voting).await;
+        let (mut responses, error) = self.requests_to_nodes::<T>(request, voting).await;
         if let Some((generation, head)) = forkchoice {
             for (node, response) in &responses {
                 node.observe_forkchoice(generation, response.payload_status(), head)
@@ -844,6 +861,12 @@ impl NodeRouter {
                     .cloned()
                     .collect();
                 let replies = join_all(nodes.iter().map(|node| node.do_request(request))).await;
+                if replies
+                    .iter()
+                    .any(|reply| reply.as_ref().err().is_some_and(|error| error.is_connect()))
+                {
+                    self.refresh_routes().await;
+                }
                 let mut common: Option<Vec<String>> = None;
                 for reply in replies {
                     let Ok(body) = reply else {
@@ -891,39 +914,53 @@ impl NodeRouter {
             | EngineMethod::engine_getBlobsV2
             | EngineMethod::engine_getBlobsV3
             | EngineMethod::engine_getBlobsV4 => {
-                let Some(node) = self.get_execution_node().await else {
-                    return (make_error(&request.id, "No nodes available"), 200);
-                };
-                match node.do_request_no_timeout(request).await {
-                    Ok(response) => (response, 200),
-                    Err(error) => (make_error(&request.id, &error.to_string()), 200),
-                }
+                self.route_primary(
+                    serde_json::to_string(request).expect("RPC request is serializable"),
+                    &request.id,
+                )
+                .await
             }
         }
     }
 
-    async fn do_route_normal(&self, request: String) -> (String, u16) {
-        // simply send request to primary node
-        let primary_node = match self.get_execution_node().await {
-            Some(primary_node) => primary_node,
-            None => {
-                tracing::warn!("No primary node available for normal request");
-                let id = match serde_json::from_str::<RpcRequest>(&request) {
-                    Ok(request) => request.id,
-                    Err(e) => {
-                        tracing::error!("Error deserializing request: {}", e);
-                        return (make_error(&0, &e.to_string()), 200);
+    async fn route_primary(&self, request: String, id: &serde_json::Value) -> (String, u16) {
+        let attempts = self.nodes.lock().await.len();
+        let mut tried = Vec::new();
+        let mut last_error = "No nodes available".to_owned();
+        for _ in 0..attempts {
+            let node = if tried.is_empty() {
+                self.get_execution_node().await
+            } else {
+                self.get_execution_node_excluding(&tried).await
+            };
+            let Some(node) = node else { break };
+            tried.push(node.url.clone());
+            match node.do_request_no_timeout_str(request.clone()).await {
+                Ok(body) => return (body, 200),
+                Err(error) => {
+                    last_error = error.to_string();
+                    if !error.is_connect() {
+                        // The server may have processed this request. Do not
+                        // replay arbitrary RPC operations after an ambiguous failure.
+                        break;
                     }
-                };
-                return (make_error(&id, "No nodes available"), 500);
+                    self.refresh_routes().await;
+                    tracing::warn!(
+                        "Connection to {} failed; trying another execution node",
+                        node.url
+                    );
+                }
             }
-        };
-
-        let resp = primary_node.do_request_no_timeout_str(request).await;
-        match resp {
-            Ok(resp) => (resp, 200),
-            Err(e) => (make_error(&1, &e.to_string()), 200),
         }
+        (make_error(id, &last_error), 200)
+    }
+
+    async fn do_route_normal(&self, request: String) -> (String, u16) {
+        let id = serde_json::from_str::<serde_json::Value>(&request)
+            .ok()
+            .and_then(|body| body.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        self.route_primary(request, &id).await
     }
 }
 
@@ -1750,6 +1787,178 @@ mod glamsterdam_tests {
         assert_eq!(response["id"], request.id);
         assert_eq!(response["jsonrpc"], "2.0");
         response
+    }
+
+    #[tokio::test]
+    async fn stopped_primary_fails_over_without_waiting_for_a_health_check() {
+        for syncing in [true, false] {
+            for method in ["eth_syncing", "engine_getBlobsV4"] {
+                let a = MockEl::new().await;
+                let b = MockEl::new().await;
+                let router = Arc::new(router(&[&a, &b]).await);
+                if syncing {
+                    for el in [&a, &b] {
+                        el.node.set_online_and_syncing().await;
+                    }
+                }
+                router.refresh_routes().await;
+                b.result(
+                    method,
+                    if method == "eth_syncing" {
+                        json!({"currentBlock":"0x1", "highestBlock":"0x100"})
+                    } else {
+                        Value::Null
+                    },
+                )
+                .await;
+                a.stop().await;
+                let req = json!({"jsonrpc":"2.0", "id":"failover", "method":method,
+                "params":if method == "eth_syncing" { json!([]) } else { json!([[hash()], "0x01000000000000000000000000000000"]) }});
+                let (body, code) = if method == "eth_syncing" {
+                    router.do_route_normal(req.to_string()).await
+                } else {
+                    router
+                        .do_engine_route(&serde_json::from_value(req.clone()).unwrap())
+                        .await
+                };
+                assert_eq!(code, 200);
+                let reply: Value = serde_json::from_str(&body).unwrap();
+                assert!(reply.get("error").is_none(), "{reply}");
+                assert_eq!(reply["id"], req["id"]);
+                assert_eq!(b.seen.lock().await.as_slice(), &[req]);
+                assert_eq!(a.node.status.read().await.status, SyncingStatus::Offline);
+                assert_eq!(router.primary_node.read().await.url, b.node.url);
+                let metrics = make_metrics_report(router.clone()).await.unwrap();
+                assert_eq!(metrics["dead_nodes"], json!([a.node.url]));
+                assert_eq!(
+                    metrics[if syncing {
+                        "syncing_nodes"
+                    } else {
+                        "alive_nodes"
+                    }],
+                    json!([b.node.url])
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_connection_failure_immediately_removes_stopped_el() {
+        let a = MockEl::new().await;
+        let b = MockEl::new().await;
+        let router = router(&[&a, &b]).await;
+        for el in [&a, &b] {
+            el.node.set_online_and_syncing().await;
+        }
+        router.refresh_routes().await;
+        b.result("engine_newPayloadV5", status("SYNCING")).await;
+        a.stop().await;
+        assert_eq!(
+            call(&router, &new_payload(true)).await["result"]["status"],
+            "SYNCING"
+        );
+        assert_eq!(router.dead_nodes.read().await.len(), 1);
+        assert_eq!(router.alive_but_syncing_nodes.read().await.len(), 1);
+        assert_eq!(router.get_execution_node().await.unwrap().url, b.node.url);
+    }
+
+    #[tokio::test]
+    async fn primary_failover_preserves_errors_and_stops_when_all_nodes_are_down() {
+        let a = MockEl::new().await;
+        let b = MockEl::new().await;
+        let router = router(&[&a, &b]).await;
+        let req = json!({"jsonrpc":"2.0","id":"keep-this-id","method":"eth_syncing","params":[]});
+        // An EL RPC error must reach the CL, not be replaced by another EL's result.
+        a.error("eth_syncing", -32602).await;
+        b.result("eth_syncing", json!(false)).await;
+        let (body, _) = router.do_route_normal(req.to_string()).await;
+        let response: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["error"]["data"], "preserve");
+        assert_eq!(response["id"], req["id"]);
+        assert!(b.seen.lock().await.is_empty());
+        a.stop().await;
+        b.stop().await;
+        let (body, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            router.do_route_normal(req.to_string()),
+        )
+        .await
+        .unwrap();
+        let response: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["id"], req["id"]);
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(router.dead_nodes.read().await.len(), 2);
+        assert!(router.get_execution_node().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupted_rpc_response_is_not_replayed_on_another_el() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = Arc::new(Node::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            JwtKey::from_secret(&[1; 32]),
+            Duration::from_secs(1),
+            false,
+        ));
+        node.set_synced().await;
+        let server = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(connection.read(&mut bytes).await.unwrap() > 0);
+            // The RPC may already have executed. Fail while returning its body.
+            connection
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
+                .await
+                .unwrap();
+        });
+        let backup = MockEl::new().await;
+        let router = NodeRouter::new(
+            0.6,
+            vec![node.clone(), backup.node.clone()],
+            node.clone(),
+            false,
+            None,
+            None,
+        );
+        let req = json!({"jsonrpc":"2.0","id":"write-rpc","method":"eth_sendRawTransaction","params":["0x01"]});
+        let (body, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            router.do_route_normal(req.to_string()),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        let response: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(response["id"], req["id"]);
+        assert!(backup.seen.lock().await.is_empty());
+        assert_eq!(node.status.read().await.status, SyncingStatus::Synced);
+    }
+
+    #[tokio::test]
+    async fn connection_failure_cannot_be_erased_by_stale_probe_or_forkchoice() {
+        let el = MockEl::new().await;
+        el.result("eth_syncing", json!(false)).await;
+        el.node.begin_forkchoice(1).await;
+        let release = el.hold(json!(1)).await;
+        let checking = el.node.clone();
+        let check = tokio::spawn(async move { checking.check_status().await });
+        el.wait_seen(&json!(1)).await;
+        el.stop().await;
+        let failure = el.node.do_request(&new_payload(true)).await.unwrap_err();
+        assert!(failure.is_connect());
+        release.notify_one();
+        check.await.unwrap().unwrap();
+        let valid: PayloadStatusV1 = serde_json::from_value(status("VALID")).unwrap();
+        let head = valid.latest_valid_hash.unwrap();
+        el.node.observe_forkchoice(1, &valid, head).await;
+        assert_eq!(el.node.status.read().await.status, SyncingStatus::Offline);
+        // A response to a subsequent forkchoice request can establish readiness.
+        el.node.begin_forkchoice(2).await;
+        el.node.observe_forkchoice(2, &valid, head).await;
+        assert_eq!(el.node.status.read().await.status, SyncingStatus::Synced);
     }
 
     #[tokio::test]
