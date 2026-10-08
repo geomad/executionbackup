@@ -282,13 +282,13 @@ impl NodeRouter {
             join_all(futs).await;
 
         for resp_nodeurl_timing in completed {
-            tracing::debug!(
-                "Response from node {} took {}ms",
-                resp_nodeurl_timing.1.url,
-                resp_nodeurl_timing.2
-            );
             match resp_nodeurl_timing.0 {
                 Ok(resp_string) => {
+                    tracing::debug!(
+                        "Response from node {} took {}ms",
+                        resp_nodeurl_timing.1.url,
+                        resp_nodeurl_timing.2
+                    );
                     // Preserve protocol errors when no EL can process this version.
                     if let Ok(response) = serde_json::from_str::<serde_json::Value>(&resp_string) {
                         if let Some(error) = response.get("error") {
@@ -328,9 +328,10 @@ impl NodeRouter {
                 }
                 Err(e) => {
                     tracing::error!(
-                        "{:?} error from node {}: {}",
+                        "{:?} request to node {} failed after {}ms: {}",
                         request.method,
                         resp_nodeurl_timing.1.url,
+                        resp_nodeurl_timing.2,
                         e
                     );
                 }
@@ -344,8 +345,24 @@ impl NodeRouter {
         // Network probes must not hold the configuration or routing locks.
         let nodes = self.nodes.lock().await.clone();
         join_all(nodes.iter().map(|node| async move {
-            if let Err(error) = node.check_status().await {
-                tracing::warn!("Health check failed for {}: {}", node.url, error);
+            let start = std::time::Instant::now();
+            match node.check_status().await {
+                Ok(health)
+                    if self.node_timings_enabled
+                        && matches!(
+                            health.status,
+                            SyncingStatus::Synced | SyncingStatus::OnlineAndSyncing
+                        ) =>
+                {
+                    tracing::info!(
+                        "Health check for {} completed in {:.2}ms; current status: {:?}",
+                        node.url,
+                        start.elapsed().as_secs_f64() * 1000.0,
+                        health.status
+                    );
+                }
+                Err(error) => tracing::warn!("Health check failed for {}: {}", node.url, error),
+                _ => {}
             }
         }))
         .await;
@@ -366,9 +383,6 @@ impl NodeRouter {
                 SyncingStatus::Synced => new_alive_nodes.push((health.resp_time, node.clone())),
                 SyncingStatus::OnlineAndSyncing => new_alive_but_syncing_nodes.push(node.clone()),
                 _ => new_dead_nodes.push(node.clone()),
-            }
-            if self.node_timings_enabled {
-                tracing::info!("{}: {:.2}ms", node.url, health.resp_time as f64 / 1000.0);
             }
         }
 
