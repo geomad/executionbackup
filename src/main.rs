@@ -758,18 +758,20 @@ impl NodeRouter {
             | EngineMethod::engine_forkchoiceUpdatedV2
             | EngineMethod::engine_forkchoiceUpdatedV3
             | EngineMethod::engine_forkchoiceUpdatedV4 => {
-                let count = if request.method == EngineMethod::engine_forkchoiceUpdatedV4 {
-                    3
-                } else {
-                    2
-                };
-                let Some(params) = request.params.as_array().filter(|p| p.len() == count) else {
+                let supports_custody = request.method == EngineMethod::engine_forkchoiceUpdatedV4;
+                // ELs may accept an omitted trailing nullable custody argument.
+                // Preserve that request form for CLs which do not supply it.
+                let Some(params) = request
+                    .params
+                    .as_array()
+                    .filter(|p| p.len() == 2 || (supports_custody && p.len() == 3))
+                else {
                     return (
                         rpc_error(&request.id, -32602, "Invalid forkchoiceUpdated params"),
                         200,
                     );
                 };
-                if count == 3
+                if params.len() == 3
                     && !params[2].is_null()
                     && !params[2]
                         .as_str()
@@ -786,7 +788,7 @@ impl NodeRouter {
                         200,
                     );
                 }
-                // Forward all params intact, including custodyColumns even with null attributes.
+                // Forward all supplied params intact, including custodyColumns with null attributes.
                 let (responses, error) = self
                     .engine_requests::<forkchoiceUpdatedResponse>(request)
                     .await;
@@ -2521,6 +2523,41 @@ mod glamsterdam_tests {
     }
 
     #[tokio::test]
+    async fn fcu_v4_forwards_requests_with_omitted_custody_columns() {
+        let a = MockEl::new().await;
+        let b = MockEl::new().await;
+        let router = router(&[&a, &b]).await;
+        for el in [&a, &b] {
+            el.result(
+                "engine_forkchoiceUpdatedV4",
+                fcu_result("SYNCING", Value::Null),
+            )
+            .await;
+        }
+
+        // Some CLs omit the trailing nullable custody argument. ELs accepting
+        // that form must still get both sync-only and payload-building updates.
+        for attributes in [false, true] {
+            let mut req = fcu(4, attributes);
+            req.params.as_array_mut().unwrap().pop();
+            let response = call(&router, &req).await;
+            assert_eq!(
+                response["result"]["payloadStatus"]["status"], "SYNCING",
+                "{response}"
+            );
+            for el in [&a, &b] {
+                assert_eq!(
+                    el.seen.lock().await.last().unwrap(),
+                    &serde_json::to_value(&req).unwrap()
+                );
+            }
+        }
+        for el in [&a, &b] {
+            assert_eq!(el.seen.lock().await.len(), 2);
+        }
+    }
+
+    #[tokio::test]
     async fn malformed_requests_return_rpc_errors_without_panics() {
         let el = MockEl::new().await;
         let router = router(&[&el]).await;
@@ -2554,6 +2591,11 @@ mod glamsterdam_tests {
         ] {
             let mut req = new_payload(true);
             req.params[3] = requests;
+            assert_eq!(call(&router, &req).await["error"]["code"], -32602);
+        }
+        for version in 1..=4 {
+            let mut req = fcu(version, false);
+            req.params.as_array_mut().unwrap().push(Value::Null);
             assert_eq!(call(&router, &req).await["error"]["code"], -32602);
         }
         let mut req = fcu(4, false);
