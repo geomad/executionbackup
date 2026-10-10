@@ -284,8 +284,9 @@ impl NodeRouter {
         for resp_nodeurl_timing in completed {
             match resp_nodeurl_timing.0 {
                 Ok(resp_string) => {
-                    tracing::debug!(
-                        "Response from node {} took {}ms",
+                    tracing::trace!(
+                        "{:?} response from {} took {}ms",
+                        request.method,
                         resp_nodeurl_timing.1.url,
                         resp_nodeurl_timing.2
                     );
@@ -355,10 +356,10 @@ impl NodeRouter {
                         ) =>
                 {
                     tracing::info!(
-                        "Health check for {} completed in {:.2}ms; current status: {:?}",
+                        "Health check {}: {:?}, {:.2}ms",
                         node.url,
-                        start.elapsed().as_secs_f64() * 1000.0,
-                        health.status
+                        health.status,
+                        start.elapsed().as_secs_f64() * 1000.0
                     );
                 }
                 Err(error) => tracing::warn!("Health check failed for {}: {}", node.url, error),
@@ -554,7 +555,7 @@ impl NodeRouter {
             }
         }
         tracing::debug!(
-            "{:?}: sending to {} ready and {} syncing voting nodes ({} excluded nodes in background)",
+            "{:?}: {} ready, {} syncing voters, {} excluded",
             request.method,
             ready.len(),
             voting.len() - ready.len(),

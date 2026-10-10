@@ -170,7 +170,11 @@ impl Node {
                     if health.forkchoice_ready.is_some() {
                         health.forkchoice_ready = Some(false);
                     }
-                    tracing::warn!("Node {} failed its health check", self.url);
+                    // Transport/HTTP/JSON errors are logged by the caller.
+                    // A parsed but invalid RPC response otherwise returns Ok.
+                    if response.is_ok() {
+                        tracing::warn!("Invalid eth_syncing response from {}", self.url);
+                    }
                 }
             }
         }
