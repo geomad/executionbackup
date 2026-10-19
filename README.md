@@ -206,6 +206,10 @@ This version implements the [Amsterdam Engine API](https://github.com/ethereum/e
 
 Earlier Engine API versions remain supported. The CL selects the API version, and the EL enforces the network's fork rules.
 
+`engine_forkchoiceUpdatedV5` is also supported, forwarding inclusion-list transactions and optional custody columns unchanged. Its `inclusionListSatisfied` response is preserved; disagreement among execution-valid voting backends returns `SYNCING`. This does not imply support for every Bogota method.
+
+If Lighthouse reports HTTP 400 and EB logs `unknown variant engine_forkchoiceUpdatedV5` or `unknown variant engine_getBlobsV4`, rebuild this checkout and replace the running EB executable. Changing Lighthouse's `--enable-partial-columns` flag cannot add missing methods to an old EB binary. The execution clients behind EB must also support the requested methods.
+
 EB returns the complete payload response with the highest block value. Payload IDs support repeated fetches for up to 120 seconds, with at most 1024 cached builds; an EL may expire its own build sooner. Responses with null payload IDs are excluded from retrieval.
 
 Capability negotiation advertises methods supported by EB and all responding voting ELs. Unreachable ELs are skipped; invalid capability responses contribute an empty set. `#do-not-use` nodes do not contribute capabilities or votes. The `engine_newPayloadV5` timeout is capped at 5.5 seconds; a smaller configured timeout still applies.

@@ -489,6 +489,8 @@ pub enum EngineMethod {
     engine_getPayloadBodiesByHashV2,
     engine_getPayloadBodiesByRangeV2,
     engine_getBlobsV4,
+    // bogota
+    engine_forkchoiceUpdatedV5,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -507,9 +509,17 @@ impl RpcRequest {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct forkchoiceUpdatedResponse {
-    pub payloadStatus: PayloadStatusV1,
+pub struct forkchoiceUpdatedResponse<T = PayloadStatusV1> {
+    pub payloadStatus: T,
     pub payloadId: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PayloadStatusV2 {
+    #[serde(flatten)]
+    pub base: PayloadStatusV1,
+    pub inclusion_list_satisfied: Option<bool>,
 }
 
 #[superstruct(

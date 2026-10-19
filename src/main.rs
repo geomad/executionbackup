@@ -118,6 +118,39 @@ fn make_error(id: &impl serde::Serialize, error: &str) -> String {
     rpc_error(id, -32603, error)
 }
 
+fn make_forkchoice_response(
+    request: &RpcRequest,
+    status: PayloadStatusV1,
+    payload_id: Option<String>,
+    inclusion_list_satisfied: Option<bool>,
+) -> String {
+    if request.method == EngineMethod::engine_forkchoiceUpdatedV5 {
+        let inclusion_list_satisfied = if status.status == PayloadStatusV1Status::Valid {
+            inclusion_list_satisfied
+        } else {
+            None
+        };
+        make_response(
+            &request.id,
+            json!(forkchoiceUpdatedResponse {
+                payloadStatus: PayloadStatusV2 {
+                    base: status,
+                    inclusion_list_satisfied
+                },
+                payloadId: payload_id,
+            }),
+        )
+    } else {
+        make_response(
+            &request.id,
+            json!(forkchoiceUpdatedResponse {
+                payloadStatus: status,
+                payloadId: payload_id
+            }),
+        )
+    }
+}
+
 fn make_syncing_str(request: &RpcRequest, payload: Option<&NewPayloadRequest>) -> String {
     if let Some(payload) = payload {
         if let Err(error) = verify_payload_block_hash(
@@ -137,13 +170,7 @@ fn make_syncing_str(request: &RpcRequest, payload: Option<&NewPayloadRequest>) -
         }
         make_response(&request.id, json!(PayloadStatusV1::new_syncing()))
     } else {
-        make_response(
-            &request.id,
-            json!(forkchoiceUpdatedResponse {
-                payloadStatus: PayloadStatusV1::new_syncing(),
-                payloadId: None,
-            }),
-        )
+        make_forkchoice_response(request, PayloadStatusV1::new_syncing(), None, None)
     }
 }
 
@@ -165,9 +192,9 @@ impl EngineResponse for PayloadStatusV1 {
     }
 }
 
-impl EngineResponse for forkchoiceUpdatedResponse {
+impl EngineResponse for forkchoiceUpdatedResponse<PayloadStatusV2> {
     fn payload_status(&self) -> &PayloadStatusV1 {
-        &self.payloadStatus
+        &self.payloadStatus.base
     }
 }
 
@@ -565,7 +592,8 @@ impl NodeRouter {
             EngineMethod::engine_forkchoiceUpdatedV1
             | EngineMethod::engine_forkchoiceUpdatedV2
             | EngineMethod::engine_forkchoiceUpdatedV3
-            | EngineMethod::engine_forkchoiceUpdatedV4 => {
+            | EngineMethod::engine_forkchoiceUpdatedV4
+            | EngineMethod::engine_forkchoiceUpdatedV5 => {
                 let generation = self.forkchoice_generation.fetch_add(1, Ordering::Relaxed) + 1;
                 let configured = self.nodes.lock().await.clone();
                 for node in &configured {
@@ -758,8 +786,13 @@ impl NodeRouter {
             EngineMethod::engine_forkchoiceUpdatedV1
             | EngineMethod::engine_forkchoiceUpdatedV2
             | EngineMethod::engine_forkchoiceUpdatedV3
-            | EngineMethod::engine_forkchoiceUpdatedV4 => {
-                let supports_custody = request.method == EngineMethod::engine_forkchoiceUpdatedV4;
+            | EngineMethod::engine_forkchoiceUpdatedV4
+            | EngineMethod::engine_forkchoiceUpdatedV5 => {
+                let supports_custody = matches!(
+                    request.method,
+                    EngineMethod::engine_forkchoiceUpdatedV4
+                        | EngineMethod::engine_forkchoiceUpdatedV5
+                );
                 // ELs may accept an omitted trailing nullable custody argument.
                 // Preserve that request form for CLs which do not supply it.
                 let Some(params) = request
@@ -791,11 +824,11 @@ impl NodeRouter {
                 }
                 // Forward all supplied params intact, including custodyColumns with null attributes.
                 let (responses, error) = self
-                    .engine_requests::<forkchoiceUpdatedResponse>(request)
+                    .engine_requests::<forkchoiceUpdatedResponse<PayloadStatusV2>>(request)
                     .await;
                 let mut statuses: Vec<_> = responses
                     .iter()
-                    .map(|(_, response)| response.payloadStatus.clone())
+                    .map(|(_, response)| response.payloadStatus.base.clone())
                     .collect();
                 let status = match self.fcu_logic(&mut statuses) {
                     Ok(status) => status,
@@ -807,12 +840,31 @@ impl NodeRouter {
                     }
                     Err(_) => return (make_syncing_str(request, None), 200),
                 };
+                let mut inclusion_list_satisfied = None;
+                if request.method == EngineMethod::engine_forkchoiceUpdatedV5
+                    && status.status == PayloadStatusV1Status::Valid
+                {
+                    let mut verdicts = responses
+                        .iter()
+                        .filter(|(_, response)| {
+                            response.payloadStatus.base.status == PayloadStatusV1Status::Valid
+                        })
+                        .map(|(_, response)| response.payloadStatus.inclusion_list_satisfied);
+                    inclusion_list_satisfied = verdicts.next().flatten();
+                    // Do not hide an EL's dissent about inclusion-list satisfaction
+                    // behind an execution-valid majority. Null remains supported for
+                    // pre-fork responses, but must not override a boolean verdict.
+                    if verdicts.any(|verdict| verdict != inclusion_list_satisfied) {
+                        tracing::warn!("ELs disagree on inclusionListSatisfied, returning SYNCING");
+                        return (make_syncing_str(request, None), 200);
+                    }
+                }
                 let mut payload_id = None;
                 if !params[1].is_null() && status.status == PayloadStatusV1Status::Valid {
                     let nodes: Vec<_> = responses
                         .into_iter()
                         .filter_map(|(node, response)| {
-                            if response.payloadStatus.status != PayloadStatusV1Status::Valid {
+                            if response.payloadStatus.base.status != PayloadStatusV1Status::Valid {
                                 return None;
                             }
                             response
@@ -856,13 +908,7 @@ impl NodeRouter {
                     }
                 }
                 (
-                    make_response(
-                        &request.id,
-                        json!(forkchoiceUpdatedResponse {
-                            payloadStatus: status,
-                            payloadId: payload_id
-                        }),
-                    ),
+                    make_forkchoice_response(request, status, payload_id, inclusion_list_satisfied),
                     200,
                 )
             }
@@ -1639,16 +1685,19 @@ mod glamsterdam_tests {
             if version >= 3 {
                 attributes["parentBeaconBlockRoot"] = json!(hash());
             }
-            if version == 4 {
+            if version >= 4 {
                 attributes["slotNumber"] = json!("0xac6000");
                 attributes["targetGasLimit"] = json!("0xbebc200");
+            }
+            if version >= 5 {
+                attributes["inclusionListTransactions"] = json!(["0x02abcdef"]);
             }
             attributes
         } else {
             Value::Null
         };
         let mut params = json!([{"headBlockHash":hash(), "safeBlockHash":hash(), "finalizedBlockHash":hash()}, attributes]);
-        if version == 4 {
+        if version >= 4 {
             params
                 .as_array_mut()
                 .unwrap()
@@ -1804,6 +1853,248 @@ mod glamsterdam_tests {
         assert_eq!(response["id"], request.id);
         assert_eq!(response["jsonrpc"], "2.0");
         response
+    }
+
+    async fn http_call(router: Arc<NodeRouter>, request: &RpcRequest) -> Value {
+        let mut headers = HeaderMap::new();
+        let key = router.general_jwt.as_ref().unwrap();
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", make_jwt(key).unwrap())
+                .parse()
+                .unwrap(),
+        );
+        let response = route_all(
+            headers,
+            Extension(router),
+            serde_json::to_string(request).unwrap(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["id"], request.id);
+        assert_eq!(response["jsonrpc"], "2.0");
+        response
+    }
+
+    #[tokio::test]
+    async fn lighthouse_fcu_v5_and_get_blobs_v4_pass_http_deserialization() {
+        let a = MockEl::new().await;
+        let b = MockEl::new().await;
+        let mut router = router(&[&a, &b]).await;
+        router.general_jwt = Some(JwtKey::from_secret(&[42; 32]));
+        let router = Arc::new(router);
+        let mut result = fcu_result("VALID", Value::Null);
+        result["payloadStatus"]["inclusionListSatisfied"] = json!(false);
+        for el in [&a, &b] {
+            el.result("engine_forkchoiceUpdatedV5", result.clone())
+                .await;
+        }
+        for custody in [
+            None,
+            Some(Value::Null),
+            Some(json!("0x01000000000000000000000000000000")),
+        ] {
+            let mut req = fcu(5, false);
+            req.params.as_array_mut().unwrap().pop();
+            if let Some(custody) = custody {
+                req.params.as_array_mut().unwrap().push(custody);
+            }
+            assert_eq!(http_call(router.clone(), &req).await["result"], result);
+            for el in [&a, &b] {
+                assert_eq!(
+                    el.seen.lock().await.last().unwrap(),
+                    &serde_json::to_value(&req).unwrap()
+                );
+            }
+        }
+        let req = request(
+            "engine_getBlobsV4",
+            json!([
+                [hash(), format!("0x01{}", "00".repeat(31))],
+                "0x03000000000000000000000000000000"
+            ]),
+        );
+        for result in [
+            json!([{"blob_cells":["0x1234",null],"proofs":["0x5678",null]},null]),
+            json!([null, null]),
+            Value::Null,
+        ] {
+            for el in [&a, &b] {
+                el.result("engine_getBlobsV4", result.clone()).await;
+            }
+            assert_eq!(http_call(router.clone(), &req).await["result"], result);
+        }
+        for el in [&a, &b] {
+            for seen in el
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|r| r["method"] == "engine_getBlobsV4")
+            {
+                assert_eq!(seen, &serde_json::to_value(&req).unwrap());
+            }
+        }
+        for method in ["engine_forkchoiceUpdatedV5", "engine_getBlobsV4"] {
+            for el in [&a, &b] {
+                el.error(method, -38005).await;
+            }
+            let req = if method == "engine_getBlobsV4" {
+                req.clone()
+            } else {
+                fcu(5, false)
+            };
+            let response = http_call(router.clone(), &req).await;
+            assert_eq!(response["error"]["code"], -38005);
+            assert_eq!(response["error"]["data"], "preserve");
+        }
+    }
+
+    #[tokio::test]
+    async fn fcu_v5_preserves_inclusion_verdicts_and_rejects_disagreement() {
+        let a = MockEl::new().await;
+        let b = MockEl::new().await;
+        let c = MockEl::new().await;
+        let router = router(&[&a, &b, &c]).await;
+        let req = fcu(5, true);
+        for verdict in [json!(true), json!(false), Value::Null] {
+            let mut result = fcu_result("VALID", json!("0x1111111111111111"));
+            result["payloadStatus"]["inclusionListSatisfied"] = verdict.clone();
+            for el in [&a, &b, &c] {
+                el.result("engine_forkchoiceUpdatedV5", result.clone())
+                    .await;
+            }
+            let response = call(&router, &req).await;
+            assert_eq!(response["result"]["payloadStatus"], result["payloadStatus"]);
+            assert!(response["result"]["payloadId"].is_string());
+            let cached_builds = router.payload_ids.lock().await.len();
+            for dissent in [json!(true), json!(false), Value::Null] {
+                if dissent == verdict {
+                    continue;
+                }
+                result["payloadStatus"]["inclusionListSatisfied"] = dissent;
+                c.result("engine_forkchoiceUpdatedV5", result.clone()).await;
+                let response = call(&router, &req).await;
+                assert_eq!(response["result"]["payloadStatus"]["status"], "SYNCING");
+                assert_eq!(
+                    response["result"]["payloadStatus"].get("inclusionListSatisfied"),
+                    Some(&Value::Null)
+                );
+                assert!(response["result"]["payloadId"].is_null());
+                assert_eq!(router.payload_ids.lock().await.len(), cached_builds);
+            }
+        }
+        // Pre-fork ELs may omit the new field. Keep their response usable.
+        for state in ["VALID", "SYNCING", "INVALID"] {
+            for el in [&a, &b, &c] {
+                el.result("engine_forkchoiceUpdatedV5", fcu_result(state, Value::Null))
+                    .await;
+            }
+            let response = call(&router, &req).await;
+            assert_eq!(response["result"]["payloadStatus"]["status"], state);
+            assert_eq!(
+                response["result"]["payloadStatus"].get("inclusionListSatisfied"),
+                Some(&Value::Null)
+            );
+        }
+        router.alive_nodes.write().await.clear();
+        router.alive_but_syncing_nodes.write().await.clear();
+        let response = call(&router, &req).await;
+        assert_eq!(response["result"]["payloadStatus"]["status"], "SYNCING");
+        assert_eq!(
+            response["result"]["payloadStatus"].get("inclusionListSatisfied"),
+            Some(&Value::Null)
+        );
+    }
+
+    #[tokio::test]
+    async fn fcu_v5_builds_payloads_and_tracks_execution_readiness() {
+        let el = MockEl::new().await;
+        let router = router(&[&el]).await;
+        el.result(
+            "engine_forkchoiceUpdatedV5",
+            fcu_result("SYNCING", Value::Null),
+        )
+        .await;
+        call(&router, &fcu(5, false)).await;
+        assert!(router.alive_nodes.read().await.is_empty());
+        assert_eq!(router.alive_but_syncing_nodes.read().await.len(), 1);
+
+        let backend_id = json!("0x1111111111111111");
+        let mut result = fcu_result("VALID", backend_id.clone());
+        result["payloadStatus"]["inclusionListSatisfied"] = json!(true);
+        el.result("engine_forkchoiceUpdatedV5", result).await;
+        let req = fcu(5, true);
+        let build = call(&router, &req).await;
+        assert_eq!(
+            build["result"]["payloadStatus"]["inclusionListSatisfied"],
+            true
+        );
+        assert!(build["result"]["payloadId"].is_string());
+        assert_eq!(router.alive_nodes.read().await.len(), 1);
+        assert!(router.alive_but_syncing_nodes.read().await.is_empty());
+        assert_eq!(
+            el.seen.lock().await.last().unwrap(),
+            &serde_json::to_value(&req).unwrap()
+        );
+
+        let result = envelope(true, "0x42");
+        el.result("engine_getPayloadV6", result.clone()).await;
+        let get = request("engine_getPayloadV6", json!([build["result"]["payloadId"]]));
+        assert_eq!(call(&router, &get).await["result"], result);
+        assert_eq!(
+            el.seen.lock().await.last().unwrap()["params"],
+            json!([backend_id])
+        );
+    }
+
+    #[tokio::test]
+    async fn fcu_v5_preserves_validation_votes_and_legacy_response_shapes() {
+        let a = MockEl::new().await;
+        let b = MockEl::new().await;
+        let c = MockEl::new().await;
+        let router = router(&[&a, &b, &c]).await;
+        let mut valid = fcu_result("VALID", Value::Null);
+        valid["payloadStatus"]["inclusionListSatisfied"] = json!(true);
+        for el in [&a, &b, &c] {
+            el.result("engine_forkchoiceUpdatedV5", valid.clone()).await;
+        }
+
+        // Inclusion-list agreement must not suppress an execution-invalid vote.
+        let mut invalid = fcu_result("INVALID", Value::Null);
+        invalid["payloadStatus"]["validationError"] = json!("invalid execution payload");
+        invalid["payloadStatus"]["inclusionListSatisfied"] = Value::Null;
+        c.result("engine_forkchoiceUpdatedV5", invalid.clone())
+            .await;
+        let response = call(&router, &fcu(5, true)).await;
+        assert_eq!(response["result"]["payloadStatus"]["status"], "SYNCING");
+        assert_eq!(
+            response["result"]["payloadStatus"].get("inclusionListSatisfied"),
+            Some(&Value::Null)
+        );
+        assert!(response["result"]["payloadId"].is_null());
+        b.result("engine_forkchoiceUpdatedV5", invalid.clone())
+            .await;
+        assert_eq!(call(&router, &fcu(5, true)).await["result"], invalid);
+        assert!(router.payload_ids.lock().await.is_empty());
+
+        // Older methods must retain the V1 status schema, even if an EL sends
+        // the new field as an extension in its response.
+        for version in 1..=4 {
+            let method = format!("engine_forkchoiceUpdatedV{version}");
+            for el in [&a, &b, &c] {
+                el.result(&method, valid.clone()).await;
+            }
+            assert_eq!(
+                call(&router, &fcu(version, false)).await["result"],
+                fcu_result("VALID", Value::Null)
+            );
+        }
     }
 
     #[tokio::test]
@@ -2025,7 +2316,7 @@ mod glamsterdam_tests {
             .await
             .push(el.node.clone());
         el.node.set_online_and_syncing().await;
-        for version in 1..=4 {
+        for version in 1..=5 {
             let method = format!("engine_forkchoiceUpdatedV{}", version);
             for state in ["VALID", "INVALID", "SYNCING"] {
                 el.result(&method, fcu_result(state, Value::Null)).await;
@@ -2524,37 +2815,38 @@ mod glamsterdam_tests {
     }
 
     #[tokio::test]
-    async fn fcu_v4_forwards_requests_with_omitted_custody_columns() {
+    async fn fcu_forwards_requests_with_omitted_custody_columns() {
         let a = MockEl::new().await;
         let b = MockEl::new().await;
         let router = router(&[&a, &b]).await;
-        for el in [&a, &b] {
-            el.result(
-                "engine_forkchoiceUpdatedV4",
-                fcu_result("SYNCING", Value::Null),
-            )
-            .await;
-        }
-
         // Some CLs omit the trailing nullable custody argument. ELs accepting
         // that form must still get both sync-only and payload-building updates.
-        for attributes in [false, true] {
-            let mut req = fcu(4, attributes);
-            req.params.as_array_mut().unwrap().pop();
-            let response = call(&router, &req).await;
-            assert_eq!(
-                response["result"]["payloadStatus"]["status"], "SYNCING",
-                "{response}"
-            );
+        for version in [4, 5] {
             for el in [&a, &b] {
+                el.result(
+                    &format!("engine_forkchoiceUpdatedV{version}"),
+                    fcu_result("SYNCING", Value::Null),
+                )
+                .await;
+            }
+            for attributes in [false, true] {
+                let mut req = fcu(version, attributes);
+                req.params.as_array_mut().unwrap().pop();
+                let response = call(&router, &req).await;
                 assert_eq!(
-                    el.seen.lock().await.last().unwrap(),
-                    &serde_json::to_value(&req).unwrap()
+                    response["result"]["payloadStatus"]["status"], "SYNCING",
+                    "{response}"
                 );
+                for el in [&a, &b] {
+                    assert_eq!(
+                        el.seen.lock().await.last().unwrap(),
+                        &serde_json::to_value(&req).unwrap()
+                    );
+                }
             }
         }
         for el in [&a, &b] {
-            assert_eq!(el.seen.lock().await.len(), 2);
+            assert_eq!(el.seen.lock().await.len(), 4);
         }
     }
 
@@ -2565,6 +2857,7 @@ mod glamsterdam_tests {
         for method in [
             "engine_getPayloadV6",
             "engine_forkchoiceUpdatedV4",
+            "engine_forkchoiceUpdatedV5",
             "engine_newPayloadV5",
         ] {
             for params in [
@@ -2594,14 +2887,16 @@ mod glamsterdam_tests {
             req.params[3] = requests;
             assert_eq!(call(&router, &req).await["error"]["code"], -32602);
         }
-        for version in 1..=4 {
+        for version in 1..=5 {
             let mut req = fcu(version, false);
             req.params.as_array_mut().unwrap().push(Value::Null);
             assert_eq!(call(&router, &req).await["error"]["code"], -32602);
         }
-        let mut req = fcu(4, false);
-        req.params[2] = json!("0x01");
-        assert_eq!(call(&router, &req).await["error"]["code"], -32602);
+        for version in [4, 5] {
+            let mut req = fcu(version, false);
+            req.params[2] = json!("0x01");
+            assert_eq!(call(&router, &req).await["error"]["code"], -32602);
+        }
         assert_eq!(
             call(
                 &router,
@@ -2622,27 +2917,43 @@ mod glamsterdam_tests {
             json!([
                 "engine_newPayloadV5",
                 "engine_getPayloadV6",
+                "engine_forkchoiceUpdatedV5",
+                "engine_getBlobsV4",
                 "engine_getBlobsV99"
             ]),
         )
         .await;
         b.result(
             "engine_exchangeCapabilities",
-            json!(["engine_newPayloadV5", "engine_getBlobsV99"]),
+            json!([
+                "engine_newPayloadV5",
+                "engine_forkchoiceUpdatedV5",
+                "engine_getBlobsV4",
+                "engine_getBlobsV99"
+            ]),
         )
         .await;
         let router = router(&[&a, &b]).await;
         let req = request("engine_exchangeCapabilities", json!([[]]));
         assert_eq!(
             call(&router, &req).await["result"],
-            json!(["engine_newPayloadV5"])
+            json!([
+                "engine_forkchoiceUpdatedV5",
+                "engine_getBlobsV4",
+                "engine_newPayloadV5"
+            ])
         );
         b.error("engine_exchangeCapabilities", -32601).await;
         assert_eq!(call(&router, &req).await["result"], json!([]));
         b.stop().await;
         assert_eq!(
             call(&router, &req).await["result"],
-            json!(["engine_getPayloadV6", "engine_newPayloadV5"])
+            json!([
+                "engine_forkchoiceUpdatedV5",
+                "engine_getBlobsV4",
+                "engine_getPayloadV6",
+                "engine_newPayloadV5"
+            ])
         );
     }
 
