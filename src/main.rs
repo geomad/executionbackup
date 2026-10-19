@@ -320,6 +320,13 @@ impl NodeRouter {
                     // Preserve protocol errors when no EL can process this version.
                     if let Ok(response) = serde_json::from_str::<serde_json::Value>(&resp_string) {
                         if let Some(error) = response.get("error") {
+                            tracing::warn!(
+                                method = ?request.method,
+                                node = %resp_nodeurl_timing.1.url,
+                                code = ?error["code"].as_i64(),
+                                message = error["message"].as_str().unwrap_or("Unspecified JSON-RPC error"),
+                                "Execution node returned a JSON-RPC error"
+                            );
                             if rpc_failure.is_none() {
                                 rpc_failure = Some(error.clone());
                             }
@@ -640,8 +647,9 @@ impl NodeRouter {
 
     fn fcu_logic(&self, resps: &mut [PayloadStatusV1]) -> Result<PayloadStatusV1, FcuLogicError> {
         if resps.is_empty() {
-            // no responses, so return SYNCING
-            tracing::error!("No responses, returning SYNCING.");
+            // The caller forwards a backend RPC error if present; only the
+            // no-error fallback synthesizes SYNCING.
+            tracing::debug!("No usable payload status responses");
             return Err(FcuLogicError::NoResponses);
         }
 
@@ -2576,6 +2584,40 @@ mod glamsterdam_tests {
             .await
             .unwrap();
         assert_eq!(reply["result"]["status"], "VALID");
+        release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn timed_out_backend_preserves_other_backends_status_or_rpc_error() {
+        let stalled = MockEl::new().await;
+        let responsive = MockEl::new().await;
+        let router = router(&[&stalled, &responsive]).await;
+
+        // Reproduce newPayloadV4 returning SYNCING from one EL while the
+        // other times out; a fast transport response does not imply VALID.
+        let req = new_payload(false);
+        responsive
+            .result("engine_newPayloadV4", status("SYNCING"))
+            .await;
+        let release = stalled.hold(req.id.clone()).await;
+        let reply = tokio::time::timeout(Duration::from_secs(2), call(&router, &req))
+            .await
+            .unwrap();
+        assert_eq!(reply["result"], status("SYNCING"));
+        release.notify_one();
+
+        // A fast forkchoice RPC error plus a timeout must reach the CL as
+        // that error, even though there are no usable payload status votes.
+        let mut req = fcu(5, false);
+        req.id = json!("forkchoice-after-timeout");
+        responsive.error("engine_forkchoiceUpdatedV5", -32601).await;
+        let release = stalled.hold(req.id.clone()).await;
+        let reply = tokio::time::timeout(Duration::from_secs(2), call(&router, &req))
+            .await
+            .unwrap();
+        assert_eq!(reply["error"]["code"], -32601);
+        assert_eq!(reply["error"]["data"], "preserve");
+        assert!(reply.get("result").is_none());
         release.notify_one();
     }
 
